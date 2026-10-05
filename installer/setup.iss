@@ -1,0 +1,161 @@
+﻿; ============================================================================
+;  Інсталятор програми «Монітор стану дисків»
+;  Збирається в Inno Setup 6 (https://jrsoftware.org/isdl.php):
+;  відкрийте цей файл в Inno Setup Compiler і натисніть Build -> Compile (Ctrl+F9).
+;  Готовий інсталятор з'явиться в папці Output поруч із папкою installer.
+; ============================================================================
+
+#define MyAppName      "Монітор стану дисків"
+#define MyAppVersion   "1.0"
+#define MyAppPublisher "Кирилюк Микола"
+#define MyAppExe       "DiskMonitor.exe"
+
+[Setup]
+; Унікальний ідентифікатор програми. Не змінюйте його між версіями,
+; інакше нова версія встановиться поруч зі старою замість оновлення.
+AppId={{8C1B6D2E-4F3A-4B7E-9A51-2D6F0C3E7B19}
+AppName={#MyAppName}
+AppVersion={#MyAppVersion}
+AppVerName={#MyAppName} {#MyAppVersion}
+AppPublisher={#MyAppPublisher}
+DefaultDirName={autopf}\DiskMonitor
+DefaultGroupName={#MyAppName}
+DisableProgramGroupPage=yes
+DisableWelcomePage=no
+ShowLanguageDialog=no
+
+; Крок з ліцензійною угодою
+LicenseFile=EULA.txt
+
+; Потрібні права адміністратора: встановлення в Program Files і створення завдання автозапуску
+PrivilegesRequired=admin
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
+MinVersion=10.0
+
+; Якщо програма запущена, інсталятор/деінсталятор попросить її закрити
+AppMutex=DiskMonitorKursova_Mutex
+CloseApplications=yes
+
+OutputDir=..\Output
+OutputBaseFilename=DiskMonitor_Setup_{#MyAppVersion}
+SetupIconFile=..\src\app.ico
+UninstallDisplayIcon={app}\{#MyAppExe}
+UninstallDisplayName={#MyAppName}
+WizardStyle=modern
+Compression=lzma2/max
+SolidCompression=yes
+
+VersionInfoVersion=1.0.0.0
+VersionInfoDescription=Інсталятор програми «{#MyAppName}»
+VersionInfoProductName={#MyAppName}
+
+[Languages]
+Name: "ukrainian"; MessagesFile: "compiler:Languages\Ukrainian.isl"
+
+[Tasks]
+Name: "desktopicon"; Description: "Створити ярлик на робочому столі"; GroupDescription: "Ярлики:"
+Name: "autostart"; Description: "Запускати програму автоматично при старті Windows (згорнутою в трей біля годинника)"; GroupDescription: "Автозавантаження:"
+
+[Files]
+Source: "..\bin\{#MyAppExe}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "EULA.txt"; DestDir: "{app}"; Flags: ignoreversion
+
+[Icons]
+Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"
+Name: "{group}\Видалити {#MyAppName}"; Filename: "{uninstallexe}"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; Tasks: desktopicon
+
+[Run]
+; Галочка на останній сторінці інсталятора
+Filename: "{app}\{#MyAppExe}"; Description: "Запустити програму прямо зараз"; Flags: nowait postinstall skipifsilent runascurrentuser
+
+[Code]
+// ---------------------------------------------------------------------------
+// Автозапуск через Планувальник завдань Windows.
+// Чому не звичайний запис у реєстрі (Run): програма з автозапуску з реєстру стартує
+// без прав адміністратора, і частина SMART-даних буде недоступна. Завдання планувальника
+// з рівнем "найвищі права" запускає програму з повними правами і без вікна UAC.
+// Якщо створити завдання не вдасться, використовується реєстр як запасний варіант.
+// ---------------------------------------------------------------------------
+const
+  AutostartName = 'DiskMonitorKursova';
+  RunKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
+
+function XmlEscape(S: String): String;
+begin
+  Result := S;
+  StringChangeEx(Result, '&', '&amp;', True);
+  StringChangeEx(Result, '<', '&lt;', True);
+  StringChangeEx(Result, '>', '&gt;', True);
+end;
+
+function RunSchtasks(Params: String): Boolean;
+var
+  Code: Integer;
+begin
+  Result := Exec(ExpandConstant('{sys}\schtasks.exe'), Params, '', SW_HIDE, ewWaitUntilTerminated, Code) and (Code = 0);
+end;
+
+procedure RemoveAutostart;
+begin
+  RunSchtasks('/Delete /F /TN "' + AutostartName + '"');
+  RegDeleteValue(HKLM, RunKey, AutostartName);
+end;
+
+procedure CreateAutostart;
+var
+  Xml: TArrayOfString;
+  XmlFile, Exe: String;
+begin
+  Exe := ExpandConstant('{app}\{#MyAppExe}');
+  XmlFile := ExpandConstant('{tmp}\autostart_task.xml');
+
+  SetArrayLength(Xml, 1);
+  Xml[0] :=
+    '<?xml version="1.0" encoding="UTF-8"?>' + #13#10 +
+    '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">' + #13#10 +
+    '  <RegistrationInfo><Description>Disk health monitor autostart (course project)</Description></RegistrationInfo>' + #13#10 +
+    '  <Triggers>' + #13#10 +
+    '    <LogonTrigger><Enabled>true</Enabled><Delay>PT15S</Delay></LogonTrigger>' + #13#10 +
+    '  </Triggers>' + #13#10 +
+    '  <Principals>' + #13#10 +
+    '    <Principal id="Author">' + #13#10 +
+    '      <GroupId>S-1-5-32-545</GroupId>' + #13#10 +
+    '      <RunLevel>HighestAvailable</RunLevel>' + #13#10 +
+    '    </Principal>' + #13#10 +
+    '  </Principals>' + #13#10 +
+    '  <Settings>' + #13#10 +
+    '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>' + #13#10 +
+    '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>' + #13#10 +
+    '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>' + #13#10 +
+    '    <AllowStartOnDemand>true</AllowStartOnDemand>' + #13#10 +
+    '    <Enabled>true</Enabled>' + #13#10 +
+    '    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>' + #13#10 +
+    '    <Priority>5</Priority>' + #13#10 +
+    '  </Settings>' + #13#10 +
+    '  <Actions Context="Author">' + #13#10 +
+    '    <Exec><Command>' + XmlEscape(Exe) + '</Command><Arguments>/tray</Arguments></Exec>' + #13#10 +
+    '  </Actions>' + #13#10 +
+    '</Task>';
+
+  if not (SaveStringsToUTF8File(XmlFile, Xml, False) and
+          RunSchtasks('/Create /F /TN "' + AutostartName + '" /XML "' + XmlFile + '"')) then
+    RegWriteStringValue(HKLM, RunKey, AutostartName, '"' + Exe + '" /tray');
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+  begin
+    RemoveAutostart;                          // прибираємо старе налаштування (при перевстановленні)
+    if WizardIsTaskSelected('autostart') then
+      CreateAutostart;
+  end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+begin
+  if CurUninstallStep = usUninstall then
+    RemoveAutostart;
+end;

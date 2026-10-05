@@ -1,0 +1,34 @@
+// Ресурси програми: іконка, маніфест, інформація про версію
+#pragma code_page(65001)
+#include <windows.h>
+#include "resource.h"
+
+IDI_APP ICON "app.ico"
+
+CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "app.manifest"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION APP_VERSION_NUM
+ PRODUCTVERSION APP_VERSION_NUM
+ FILEOS VOS_NT_WINDOWS32
+ FILETYPE VFT_APP
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "042204B0"
+        BEGIN
+            VALUE "CompanyName",      "Курсовий проект"
+            VALUE "FileDescription",  "Монітор стану дисків (HDD/SSD)"
+            VALUE "FileVersion",      APP_VERSION_STR
+            VALUE "InternalName",     "DiskMonitor"
+            VALUE "LegalCopyright",   "(c) 2026 Кирилюк Микола"
+            VALUE "OriginalFilename", "DiskMonitor.exe"
+            VALUE "ProductName",      "Монітор стану дисків"
+            VALUE "ProductVersion",   APP_VERSION_STR
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0422, 1200
+    END
+END

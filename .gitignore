@@ -1,0 +1,18 @@
+# Результати збірки
+bin/
+obj/
+Output/
+x64/
+Debug/
+Release/
+
+# Файли Visual Studio
+.vs/
+*.user
+*.aps
+*.ipch
+*.pdb
+*.ilk
+
+# Документи до курсового проєкту (не для публікації)
+docs/
