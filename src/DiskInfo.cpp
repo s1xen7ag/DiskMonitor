@@ -257,19 +257,97 @@ void FinishDisk(PhysicalDisk& d) {
     if (auto a = FindAttr(d, 197)) d.pending       = (long long)(a->raw & 0xFFFFFFFF);
     if (auto a = FindAttr(d, 198)) d.uncorrectable = (long long)(a->raw & 0xFFFFFFFF);
 
-    // Знос SSD: у різних виробників різні атрибути, але нормалізоване значення
-    // в них означає "скільки ресурсу залишилось, %".
-    // Якщо знос відомий і з WMI, і з SMART, беремо більше значення: деякі драйвери
-    // повертають у WMI 0 замість "немає даних".
-    if (d.isSsd) {
-        for (int id : {231, 233, 177, 169, 202}) {
+    // Знос SSD. Для NVMe його дає журнал стану (Percentage Used). Для SATA SSD — атрибути SMART
+    // виробника, у яких нормалізоване значення означає «скільки ресурсу залишилось, %».
+    // Лічильник надійності Windows для багатьох SATA SSD повертає 0 навіть тоді, коли накопичувач
+    // знос не повідомляє, тому сам по собі цей 0 не означає «100 % ресурсу».
+    if (d.hasNvmeLog) {
+        d.wearSource = L"журнал стану NVMe (Percentage Used)";
+    } else if (d.isSsd) {
+        int wmiWear = d.wear;
+        int smartWear = -1, smartId = 0;
+        // Атрибути, які в усіх виробників означають залишок ресурсу
+        for (int id : {231, 169, 202, 177}) {
             auto a = FindAttr(d, id);
-            if (a && a->current > 0 && a->current <= 100) {
-                d.wear = std::max(d.wear, 100 - a->current);
-                break;
+            if (a && a->current > 0 && a->current <= 100) { smartWear = 100 - a->current; smartId = id; break; }
+        }
+        // Атрибути, які в різних виробників означають різне (наприклад, у Kingston/Phison 233 —
+        // це обсяг записаних даних, і він завжди 100): беремо, лише якщо значення вже зменшилось
+        if (smartWear < 0) {
+            for (int id : {233, 230, 173}) {
+                auto a = FindAttr(d, id);
+                bool sure = (id == 233 && Contains(d.model, L"INTEL"));
+                if (a && a->current > 0 && a->current <= 100 && (a->current < 100 || sure)) {
+                    smartWear = 100 - a->current; smartId = id; break;
+                }
             }
         }
+        if (smartWear >= 0 && smartWear >= wmiWear) {
+            d.wear = smartWear;
+            d.wearSource = L"атрибут SMART " + std::to_wstring(smartId) + L" («" + SmartAttrName(smartId) + L"»)";
+        } else if (wmiWear > 0) {
+            d.wear = wmiWear;
+            d.wearSource = L"лічильник надійності Windows";
+        } else {
+            d.wear = -1;   // Windows дав 0, але SMART цього не підтверджує: краще «немає даних», ніж хибні 100 %
+        }
     }
+}
+
+// Індекс механічного стану HDD — власна оцінка програми (0–100 %).
+// Жорсткі диски не повідомляють «відсоток ресурсу», як SSD, бо магнітні пластини не зношуються
+// від записів. Зате вони зношуються механічно, і це видно з атрибутів SMART. Індекс рахується як
+// 100 мінус штрафи за кожну ознаку зносу; кожен штраф записується в hddHealthDetails, щоб було
+// видно, з чого складається оцінка.
+void ComputeHddHealth(PhysicalDisk& d) {
+    d.hddHealth = -1;
+    d.hddHealthDetails.clear();
+    if (d.isSsd || d.type != L"HDD" || d.smart.empty()) return;   // без даних SMART оцінювати нічим
+
+    int score = 100;
+    auto penalty = [&](double p, const std::wstring& why) {
+        int pts = (int)(p + 0.5);
+        if (pts <= 0) return;
+        score -= pts;
+        d.hddHealthDetails.push_back(L"−" + std::to_wstring(pts) + L" — " + why);
+    };
+    auto raw = [&](int id) -> long long {
+        auto a = FindAttr(d, id);
+        return a ? (long long)(a->raw & 0xFFFFFFFF) : -1;
+    };
+
+    // Пошкодження поверхні — найвагоміші ознаки
+    if (d.reallocated > 0)   penalty(std::min(40.0, d.reallocated * 1.0),   L"перепризначені сектори: " + FormatNumber(d.reallocated));
+    if (d.pending > 0)       penalty(std::min(30.0, d.pending * 2.0),       L"нестабільні сектори: " + FormatNumber(d.pending));
+    if (d.uncorrectable > 0) penalty(std::min(30.0, d.uncorrectable * 2.0), L"невиправні сектори: " + FormatNumber(d.uncorrectable));
+    long long reported = raw(187);
+    if (reported > 0)        penalty(std::min(20.0, reported * 2.0),        L"невиправні помилки читання: " + FormatNumber(reported));
+    // Механіка: двигун шпинделя і паркування головок
+    long long spinRetry = raw(10);
+    if (spinRetry > 0)       penalty(std::min(20.0, spinRetry * 10.0),      L"повторні спроби розкручування шпинделя: " + FormatNumber(spinRetry));
+    long long loadCycles = raw(193);
+    if (loadCycles > 0)      penalty(std::min(10.0, loadCycles * 10.0 / 300000.0), L"цикли паркування головок: " + FormatNumber(loadCycles) + L" (типовий ресурс 300 000)");
+    long long starts = raw(4);
+    if (starts > 0)          penalty(std::min(5.0, starts * 5.0 / 50000.0), L"запуски шпинделя: " + FormatNumber(starts) + L" (типовий ресурс 50 000)");
+    // Вік: з роками ймовірність відмови зростає навіть без помилок
+    if (d.powerOnHours > 0)  penalty(std::min(15.0, d.powerOnHours * 15.0 / 50000.0), L"напрацювання: " + FormatNumber(d.powerOnHours) + L" год");
+
+    // Явні ознаки несправності обмежують індекс зверху, хоч би якою була сума штрафів
+    int cap = 100; std::wstring capWhy;
+    auto limit = [&](int c, const wchar_t* why) { if (c < cap) { cap = c; capWhy = why; } };
+    if (d.smartPredictFail == 1) limit(10, L"SMART прогнозує відмову");
+    if (d.winHealth == 2)        limit(10, L"Windows позначила диск як несправний");
+    else if (d.winHealth == 1)   limit(50, L"Windows повідомляє про проблеми з диском");
+    for (auto& a : d.smart)
+        if ((a.flags & 0x01) && a.threshold > 0 && a.current > 0 && a.current <= a.threshold)
+            limit(10, L"критичний атрибут SMART досяг порогу");
+
+    score = std::max(0, std::min(100, score));
+    if (score > cap) {
+        d.hddHealthDetails.push_back(L"обмежено до " + std::to_wstring(cap) + L"%: " + capWhy);
+        score = cap;
+    }
+    d.hddHealth = score;
 }
 
 std::wstring Pad(const std::wstring& label, size_t width = 28) {
@@ -570,6 +648,7 @@ std::vector<DiskLoad> WmiReader::ReadLoadWmi() {
 void AnalyzeDisk(PhysicalDisk& d) {
     bool critical = false, warning = false;
     d.notes.clear();
+    ComputeHddHealth(d);
 
     if (d.smartPredictFail == 1) {
         critical = true;
@@ -789,6 +868,16 @@ std::wstring DiskDescription(const PhysicalDisk& d) {
         if (d.wear >= 0)
             w = std::to_wstring(d.wear) + L"% (залишилось " + std::to_wstring(std::max(0, 100 - d.wear)) + L"%)";
         t += Pad(L"Використаний ресурс SSD") + w + nl;
+        if (d.wear >= 0 && !d.wearSource.empty()) t += Pad(L"Джерело даних про знос") + d.wearSource + nl;
+    }
+    if (d.type == L"HDD") {
+        if (d.hddHealth >= 0) {
+            t += Pad(L"Індекс механічного стану") + std::to_wstring(d.hddHealth) + L"% (оцінка програми)" + nl;
+            if (d.hddHealthDetails.empty()) t += L"    ознак механічного зносу не виявлено" + nl;
+            for (auto& s : d.hddHealthDetails) t += L"    " + s + nl;
+        } else {
+            t += Pad(L"Індекс механічного стану") + na + nl;
+        }
     }
     if (d.hasNvmeLog) {
         t += Pad(L"Доступний резерв") + std::to_wstring(d.nvmeSpare) + L"% (критичний поріг " +

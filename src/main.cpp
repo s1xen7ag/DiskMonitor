@@ -412,10 +412,11 @@ static void FillDisks() {
         const PhysicalDisk& d = disks[i];
         std::wstring temp = d.temperature >= 0 ? std::to_wstring(d.temperature) + L" °C" : L"—";
         std::wstring hours = d.powerOnHours >= 0 ? FormatNumber(d.powerOnHours) + L" год" : L"—";
-        // У HDD немає лічильника ресурсу (він є лише в SSD), тому пишемо "н/з" — не застосовується.
-        // Прочерк лишається для SSD, які не повідомляють знос, і для дисків невідомого типу.
-        std::wstring life = (d.isSsd && d.wear >= 0) ? std::to_wstring(std::max(0, 100 - d.wear)) + L"%"
-                          : (d.type == L"HDD") ? L"н/з" : L"—";
+        // «Здоров’я»: для SSD — залишок ресурсу, для HDD — індекс механічного стану (оцінка програми).
+        // Прочерк — якщо даних немає (без прав адміністратора, USB-накопичувачі, SSD без даних про знос).
+        std::wstring life = L"—";
+        if (d.isSsd && d.wear >= 0)  life = std::to_wstring(std::max(0, 100 - d.wear)) + L"%";
+        else if (d.hddHealth >= 0)   life = std::to_wstring(d.hddHealth) + L"%";
         SetRow(g.lvDisks, (int)i, {
             std::to_wstring(d.index), d.model, d.type, d.bus.empty() ? L"—" : d.bus,
             FormatSize(d.size), d.letters.empty() ? L"—" : d.letters,
@@ -933,7 +934,7 @@ static void CreateMainControls(HWND hwnd) {
     AddColumn(g.lvDisks, 5, L"Розділи", 75);
     AddColumn(g.lvDisks, 6, L"Температура", 95, LVCFMT_RIGHT);
     AddColumn(g.lvDisks, 7, L"Напрацювання", 110, LVCFMT_RIGHT);
-    AddColumn(g.lvDisks, 8, L"Ресурс SSD", 85, LVCFMT_RIGHT);
+    AddColumn(g.lvDisks, 8, L"Здоров’я", 85, LVCFMT_RIGHT);
     AddColumn(g.lvDisks, 9, L"Стан", 90, LVCFMT_CENTER);
 
     g.lvVols = CreateList(hwnd, IDC_LIST_VOLS, rowH);

@@ -37,6 +37,7 @@ struct PhysicalDisk {
     // Основні показники (-1 = немає даних)
     int temperature = -1;
     int wear = -1;                  // використаний ресурс SSD, %
+    std::wstring wearSource;        // звідки взято знос SSD: журнал NVMe, атрибут SMART або Windows
     long long powerOnHours = -1;
     long long powerCycles = -1;
     long long reallocated = -1;     // перепризначені сектори (SMART 5)
@@ -59,6 +60,10 @@ struct PhysicalDisk {
     long long nvmeErrorLogEntries = -1;
     long long nvmeWarnTempMinutes = -1;
     long long nvmeCritTempMinutes = -1;
+
+    // Індекс механічного стану HDD — оцінка програми (0..100 %, -1 = немає даних SMART)
+    int hddHealth = -1;
+    std::vector<std::wstring> hddHealthDetails;   // з чого складається оцінка: «−8 — напрацювання …»
 
     // Результат аналізу
     Health verdict = Health::Unknown;

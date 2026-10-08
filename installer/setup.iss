@@ -6,7 +6,7 @@
 ; ============================================================================
 
 #define MyAppName      "Монітор стану дисків"
-#define MyAppVersion   "1.0"
+#define MyAppVersion   "1.1"
 #define MyAppPublisher "Кирилюк Микола"
 #define MyAppExe       "DiskMonitor.exe"
 
@@ -46,7 +46,7 @@ WizardStyle=modern
 Compression=lzma2/max
 SolidCompression=yes
 
-VersionInfoVersion=1.0.0.0
+VersionInfoVersion=1.1.0.0
 VersionInfoDescription=Інсталятор програми «{#MyAppName}»
 VersionInfoProductName={#MyAppName}
 
