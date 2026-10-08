@@ -224,6 +224,80 @@ bool Contains(const std::wstring& text, const wchar_t* what) {
     return Upper(text).find(what) != std::wstring::npos;
 }
 
+// Залишок ресурсу SATA SSD за SMART, % (1..100) або -1, якщо диск його не повідомляє.
+// Атрибути SMART не стандартизовані: той самий номер у різних виробників означає різне, а залишок
+// ресурсу одні контролери записують у нормалізоване значення атрибута, інші — у «сире». Тому
+// правило вибирається за виробником (назвою моделі) або за набором атрибутів, характерним для
+// контролера. Правила узгоджені з тим, як ресурс читає програма CrystalDiskInfo.
+// how — звідки взято значення (показується у вікні деталей).
+int SsdLifeFromSmart(const PhysicalDisk& d, std::wstring& how) {
+    auto source = [&](int id, const wchar_t* name, const wchar_t* field) {
+        how = L"атрибут SMART " + std::to_wstring(id) + L" («" + name + L"», " + field + L")";
+    };
+    // Залишок у нормалізованому значенні атрибута (100 — новий диск)
+    auto normalized = [&](int id, const wchar_t* name) -> int {
+        auto a = FindAttr(d, id);
+        if (!a || a->current <= 0 || a->current > 100) return -1;
+        source(id, name, L"нормалізоване значення");
+        return a->current;
+    };
+    // Залишок у молодшому байті «сирого» значення
+    auto rawPercent = [&](int id, const wchar_t* name) -> int {
+        auto a = FindAttr(d, id);
+        int v = a ? (int)(a->raw & 0xFF) : -1;
+        if (v <= 0 || v > 100) return -1;
+        source(id, name, L"сире значення");
+        return v;
+    };
+    auto has = [&](std::initializer_list<int> ids) {
+        for (int id : ids) if (!FindAttr(d, id)) return false;
+        return true;
+    };
+    std::wstring m = Upper(d.model);
+    auto startsWith = [&](const wchar_t* p) { return m.rfind(p, 0) == 0; };
+
+    if (Contains(d.model, L"SAMSUNG"))
+        return normalized(177, L"Wear Leveling Count");
+    if (Contains(d.model, L"CRUCIAL") || Contains(d.model, L"MICRON") || startsWith(L"MTFD") ||
+        (startsWith(L"CT") && Contains(d.model, L"SSD")))
+        return normalized(202, L"Percent Lifetime Remaining");
+    if (Contains(d.model, L"INTEL"))
+        return normalized(233, L"Media Wearout Indicator");
+    if (startsWith(L"WDC ") || startsWith(L"WD ") || Contains(d.model, L"SANDISK")) {
+        // WD і SanDisk записують використаний ресурс у другий байт сирого значення атрибута 230
+        auto a = FindAttr(d, 230);
+        int used = a ? (int)((a->raw >> 8) & 0xFF) : -1;
+        if (used < 0 || used >= 100) return -1;
+        source(230, L"Media Wearout Indicator", L"сире значення");
+        return 100 - used;
+    }
+    if (Contains(d.model, L"TOSHIBA") || Contains(d.model, L"KIOXIA")) {
+        auto a = FindAttr(d, 173);
+        int v = a ? a->current - 100 : -1;   // у Toshiba нормалізоване значення відраховується від 200
+        if (v <= 0 || v > 100) return -1;
+        source(173, L"Wear Leveling", L"нормалізоване значення мінус 100");
+        return v;
+    }
+    if (Contains(d.model, L"SA400")) {
+        // Kingston A400: залишок — у сирому значенні атрибута 231, а нормалізоване значення в
+        // більшості прошивок його не відображає (крім прошивки 03070009)
+        if (d.firmware.rfind(L"03070009", 0) == 0) return normalized(231, L"SSD Life Left");
+        return rawPercent(231, L"SSD Life Left");
+    }
+    if (Contains(d.model, L"KINGSTON")) {
+        int v = normalized(231, L"SSD Life Left");
+        return v >= 0 ? v : normalized(169, L"Remaining Life");
+    }
+    // Контролери Silicon Motion (ADATA, Silicon Power, Transcend та ін.): сире значення атрибута 169
+    if (has({ 160, 161, 163, 169 }))
+        return rawPercent(169, L"Remaining Life");
+    // Контролери Phison (Patriot, Goodram, PNY та ін.): сире значення атрибута 231
+    if (has({ 168, 170, 173, 218, 231 }))
+        return rawPercent(231, L"SSD Life Left");
+    // Інші (SandForce, SK hynix тощо): атрибут 231 у нормалізованому значенні
+    return normalized(231, L"SSD Life Left");
+}
+
 // Доповнює дані, яких не вистачає, на основі SMART і назви моделі
 void FinishDisk(PhysicalDisk& d) {
     if (d.type.empty()) {
@@ -258,33 +332,19 @@ void FinishDisk(PhysicalDisk& d) {
     if (auto a = FindAttr(d, 198)) d.uncorrectable = (long long)(a->raw & 0xFFFFFFFF);
 
     // Знос SSD. Для NVMe його дає журнал стану (Percentage Used). Для SATA SSD — атрибути SMART
-    // виробника, у яких нормалізоване значення означає «скільки ресурсу залишилось, %».
-    // Лічильник надійності Windows для багатьох SATA SSD повертає 0 навіть тоді, коли накопичувач
-    // знос не повідомляє, тому сам по собі цей 0 не означає «100 % ресурсу».
+    // виробника (див. SsdLifeFromSmart). Лічильник надійності Windows для багатьох SATA SSD
+    // повертає 0 навіть тоді, коли накопичувач знос не повідомляє, тому сам по собі цей 0
+    // не означає «100 % ресурсу».
     if (d.hasNvmeLog) {
         d.wearSource = L"журнал стану NVMe (Percentage Used)";
     } else if (d.isSsd) {
         int wmiWear = d.wear;
-        int smartWear = -1, smartId = 0;
-        // Атрибути, які в усіх виробників означають залишок ресурсу
-        for (int id : {231, 169, 202, 177}) {
-            auto a = FindAttr(d, id);
-            if (a && a->current > 0 && a->current <= 100) { smartWear = 100 - a->current; smartId = id; break; }
-        }
-        // Атрибути, які в різних виробників означають різне (наприклад, у Kingston/Phison 233 —
-        // це обсяг записаних даних, і він завжди 100): беремо, лише якщо значення вже зменшилось
-        if (smartWear < 0) {
-            for (int id : {233, 230, 173}) {
-                auto a = FindAttr(d, id);
-                bool sure = (id == 233 && Contains(d.model, L"INTEL"));
-                if (a && a->current > 0 && a->current <= 100 && (a->current < 100 || sure)) {
-                    smartWear = 100 - a->current; smartId = id; break;
-                }
-            }
-        }
+        std::wstring how;
+        int life = SsdLifeFromSmart(d, how);
+        int smartWear = life >= 0 ? 100 - life : -1;
         if (smartWear >= 0 && smartWear >= wmiWear) {
             d.wear = smartWear;
-            d.wearSource = L"атрибут SMART " + std::to_wstring(smartId) + L" («" + SmartAttrName(smartId) + L"»)";
+            d.wearSource = how;
         } else if (wmiWear > 0) {
             d.wear = wmiWear;
             d.wearSource = L"лічильник надійності Windows";

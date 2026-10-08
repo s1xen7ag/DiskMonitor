@@ -57,7 +57,7 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <AdditionalDependencies>wbemuuid.lib;comctl32.lib;comdlg32.lib;uxtheme.lib;shell32.lib;ole32.lib;oleaut32.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>wbemuuid.lib;comctl32.lib;comdlg32.lib;uxtheme.lib;shell32.lib;ole32.lib;oleaut32.lib;advapi32.lib;winhttp.lib;bcrypt.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <ResourceCompile>
       <Culture>0x0422</Culture>
@@ -91,9 +91,11 @@
   <ItemGroup>
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\DiskInfo.cpp" />
+    <ClCompile Include="src\Updater.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="src\DiskInfo.h" />
+    <ClInclude Include="src\Updater.h" />
     <ClInclude Include="src\resource.h" />
   </ItemGroup>
   <ItemGroup>

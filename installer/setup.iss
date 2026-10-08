@@ -6,9 +6,11 @@
 ; ============================================================================
 
 #define MyAppName      "Монітор стану дисків"
-#define MyAppVersion   "1.1"
+#define MyAppVersion   "1.2"
 #define MyAppPublisher "Кирилюк Микола"
 #define MyAppExe       "DiskMonitor.exe"
+; Іменований mutex, який створює запущена програма (див. kMutexName у main.cpp)
+#define MyAppMutex     "DiskMonitorKursova_Mutex"
 
 [Setup]
 ; Унікальний ідентифікатор програми. Не змінюйте його між версіями,
@@ -33,9 +35,11 @@ ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
 
-; Якщо програма запущена, інсталятор/деінсталятор попросить її закрити
-AppMutex=DiskMonitorKursova_Mutex
+; Чи запущена програма, перевіряється в розділі [Code] (InitializeSetup), а не директивою AppMutex:
+; під час автоматичного оновлення інсталятор має дочекатися, поки програма сама закриється
 CloseApplications=yes
+; Налаштування програми в реєстрі (HKCU) видаляються разом із програмою
+UsedUserAreasWarning=no
 
 OutputDir=..\Output
 OutputBaseFilename=DiskMonitor_Setup_{#MyAppVersion}
@@ -46,7 +50,7 @@ WizardStyle=modern
 Compression=lzma2/max
 SolidCompression=yes
 
-VersionInfoVersion=1.1.0.0
+VersionInfoVersion=1.2.0.0
 VersionInfoDescription=Інсталятор програми «{#MyAppName}»
 VersionInfoProductName={#MyAppName}
 
@@ -66,9 +70,15 @@ Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"
 Name: "{group}\Видалити {#MyAppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; Tasks: desktopicon
 
+[Registry]
+; Налаштування (перевірка оновлень) створює сама програма; тут лише видалення разом із програмою
+Root: HKCU; Subkey: "Software\DiskMonitorKursova"; Flags: uninsdeletekey dontcreatekey
+
 [Run]
 ; Галочка на останній сторінці інсталятора
 Filename: "{app}\{#MyAppExe}"; Description: "Запустити програму прямо зараз"; Flags: nowait postinstall skipifsilent runascurrentuser
+; Після автоматичного оновлення (тихий режим) нова версія запускається сама
+Filename: "{app}\{#MyAppExe}"; Parameters: "{code:RestartParams}"; Flags: nowait runascurrentuser; Check: IsUpdateMode
 
 [Code]
 // ---------------------------------------------------------------------------
@@ -142,6 +152,73 @@ begin
   if not (SaveStringsToUTF8File(XmlFile, Xml, False) and
           RunSchtasks('/Create /F /TN "' + AutostartName + '" /XML "' + XmlFile + '"')) then
     RegWriteStringValue(HKLM, RunKey, AutostartName, '"' + Exe + '" /tray');
+end;
+
+// ---------------------------------------------------------------------------
+// Автоматичне оновлення.
+// Програма завантажує новий інсталятор, запускає його з параметрами
+// /SILENT /SUPPRESSMSGBOXES /NORESTART /UPDATE [/TRAY] і одразу закривається.
+// /UPDATE — дочекатися, поки стара копія програми закриється, і після встановлення запустити нову;
+// /TRAY — програма до оновлення працювала згорнутою в трей, тож і нова запускається в треї.
+// ---------------------------------------------------------------------------
+function HasParam(Name: String): Boolean;
+var
+  I: Integer;
+begin
+  Result := False;
+  for I := 1 to ParamCount do
+    if CompareText(ParamStr(I), Name) = 0 then
+      Result := True;
+end;
+
+function IsUpdateMode: Boolean;
+begin
+  Result := HasParam('/UPDATE');
+end;
+
+function RestartParams(Param: String): String;
+begin
+  Result := '/noelevate';
+  if HasParam('/TRAY') then
+    Result := Result + ' /tray';
+end;
+
+// Чекає, поки програма закриється. Під час оновлення вона закривається сама (до 30 с),
+// інакше користувача просять закрити її, як це робить стандартна перевірка AppMutex.
+function WaitForAppClosed(Msg: String): Boolean;
+var
+  I: Integer;
+begin
+  if IsUpdateMode then
+  begin
+    Log('Автоматичне оновлення: чекаємо, поки програма закриється');
+    I := 0;
+    while CheckForMutexes('{#MyAppMutex}') and (I < 60) do
+    begin
+      Sleep(500);
+      I := I + 1;
+    end;
+    Log(Format('Очікування тривало %d мс', [I * 500]));
+    Sleep(1000);   // mutex зникає трохи раніше, ніж процес завершується повністю
+  end;
+
+  Result := True;
+  while CheckForMutexes('{#MyAppMutex}') do
+    if SuppressibleMsgBox(FmtMessage(Msg, ['{#MyAppName}']), mbError, MB_OKCANCEL, IDCANCEL) <> IDOK then
+    begin
+      Result := False;
+      Exit;
+    end;
+end;
+
+function InitializeSetup: Boolean;
+begin
+  Result := WaitForAppClosed(SetupMessage(msgSetupAppRunningError));
+end;
+
+function InitializeUninstall: Boolean;
+begin
+  Result := WaitForAppClosed(SetupMessage(msgUninstallAppRunningError));
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);

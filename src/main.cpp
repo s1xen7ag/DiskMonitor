@@ -6,6 +6,7 @@
 //   3) активність дисків у реальному часі (завантаженість, швидкість читання/запису).
 // Дані збираються у фоновому потоці, щоб інтерфейс не "підвисав" під час запитів WMI.
 // Програма може працювати згорнутою в трей і попереджати про проблеми з дисками.
+// Раз на добу вона перевіряє, чи вийшла нова версія, і пропонує оновитися (див. Updater.cpp).
 
 #ifndef UNICODE
 #define UNICODE
@@ -38,6 +39,7 @@
 #include <algorithm>
 
 #include "DiskInfo.h"
+#include "Updater.h"
 #include "resource.h"
 
 #ifdef _MSC_VER
@@ -64,18 +66,26 @@ static const wchar_t* kDetailsClass = L"DiskMonitorKursova_Details";
 static const DWORD LOAD_INTERVAL_MS = 2000;     // як часто оновлювати активність дисків
 static const DWORD FULL_SCAN_MS     = 60000;    // як часто повністю перечитувати стан дисків
 
+static const wchar_t* kSettingsKey = L"Software\\DiskMonitorKursova";   // налаштування в реєстрі (HKCU)
+static const UINT UPDATE_FIRST_MS    = 15 * 1000;             // перша перевірка оновлень — через 15 с після запуску
+static const UINT UPDATE_INTERVAL_MS = 24 * 60 * 60 * 1000;   // далі — раз на добу
+static const UINT_PTR IDT_UPDATE = 1;
+
 enum {
     WM_APP_SNAPSHOT = WM_APP + 1,   // фоновий потік передав новий знімок стану дисків
     WM_APP_LOAD,                    // фоновий потік передав дані про активність
     WM_APP_TRAY,                    // подія від значка в треї
-    WM_APP_SHOWME                   // інша копія програми просить показати вікно
+    WM_APP_SHOWME,                  // інша копія програми просить показати вікно
+    WM_APP_UPDATE_INFO,             // перевірка оновлень завершилась
+    WM_APP_UPDATE_FILE              // завантаження інсталятора нової версії завершилось
 };
 
 enum {
     IDC_BTN_REFRESH = 101, IDC_BTN_DETAILS, IDC_BTN_REPORT, IDC_BTN_LOG, IDC_BTN_ADMIN, IDC_BTN_ABOUT,
     IDC_LIST_DISKS = 201, IDC_LIST_VOLS, IDC_LIST_LOAD, IDC_LIST_SMART, IDC_LIST_NVME,
     IDC_STATUS = 301,
-    ID_TRAY_OPEN = 401, ID_TRAY_REFRESH, ID_TRAY_EXIT
+    ID_TRAY_OPEN = 401, ID_TRAY_REFRESH, ID_TRAY_EXIT, ID_TRAY_UPDATE_CHECK, ID_TRAY_UPDATE_AUTO,
+    IDB_UPDATE_NOW = 501, IDB_UPDATE_PAGE, IDB_ABOUT_UPDATE   // кнопки у вікнах TaskDialog
 };
 
 // Номери колонок, які малюються особливо
@@ -110,6 +120,15 @@ struct AppState {
 
     std::map<std::wstring, Health> lastVerdict;   // для відстеження змін стану дисків
     std::set<std::wstring> lowSpaceAlerted;       // розділи, про які вже попередили
+
+    // Оновлення програми
+    bool autoUpdate = true;          // перевіряти оновлення раз на добу
+    bool updateBusy = false;         // зараз іде перевірка або завантаження
+    bool updateDialogOpen = false;
+    bool balloonIsUpdate = false;    // останнє сповіщення в треї — про нову версію
+    bool hasUpdate = false;          // знайдено новішу версію
+    UpdateInfo update;
+    std::wstring updateLogged;       // про яку версію вже записано в журнал
 } g;
 
 static HANDLE g_evStop = nullptr;      // зупинити фоновий потік
@@ -366,6 +385,7 @@ static void TrayTip(const std::wstring& tip) {
 }
 
 static void TrayBalloon(const std::wstring& title, const std::wstring& text, DWORD icon) {
+    g.balloonIsUpdate = false;
     NOTIFYICONDATAW n{};
     n.cbSize = sizeof(n);
     n.hWnd = g.main;
@@ -834,16 +854,221 @@ static void RestartAsAdmin() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Оновлення програми (мережева частина — в Updater.cpp)
+// ---------------------------------------------------------------------------
+
+static bool LoadAutoUpdate() {
+    DWORD value = 1, size = sizeof(value);
+    if (RegGetValueW(HKEY_CURRENT_USER, kSettingsKey, L"CheckUpdates", RRF_RT_REG_DWORD, nullptr, &value, &size) != ERROR_SUCCESS)
+        return true;   // за замовчуванням перевірка увімкнена
+    return value != 0;
+}
+
+static void SaveAutoUpdate(bool on) {
+    DWORD value = on ? 1 : 0;
+    RegSetKeyValueW(HKEY_CURRENT_USER, kSettingsKey, L"CheckUpdates", REG_DWORD, &value, sizeof(value));
+}
+
+// Вікно-власник для повідомлень: головне вікно, якщо воно на екрані
+static HWND DialogOwner() {
+    return IsWindowVisible(g.main) && !IsIconic(g.main) ? g.main : nullptr;
+}
+
+// Відкриває сторінку в браузері. Копія з правами адміністратора передає адресу Провіднику,
+// щоб браузер запустився зі звичайними правами.
+static void OpenUrl(const std::wstring& url) {
+    if (g.isAdmin) ShellExecuteW(nullptr, L"open", L"explorer.exe", url.c_str(), nullptr, SW_SHOWNORMAL);
+    else           ShellExecuteW(nullptr, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+}
+
+struct UpdateCheckResult {
+    bool ok = false;
+    bool manual = false;    // перевірку запустив користувач — показати результат, навіть якщо оновлень немає
+    UpdateInfo info;
+    std::wstring error;
+};
+
+struct UpdateFileResult {
+    HANDLE file = INVALID_HANDLE_VALUE;
+    std::wstring path, error;
+};
+
+// Запит до GitHub виконується у фоновому потоці, щоб вікно не чекало на відповідь сервера
+static void StartUpdateCheck(bool manual) {
+    if (g.updateBusy) return;
+    g.updateBusy = true;
+    if (manual) SendMessageW(g.status, SB_SETTEXTW, 0, (LPARAM)L"Перевірка оновлень…");
+    HWND target = g.main;
+    std::thread([target, manual] {
+        auto* r = new UpdateCheckResult();
+        r->manual = manual;
+        r->ok = FetchLatestRelease(r->info, r->error);
+        if (!PostMessageW(target, WM_APP_UPDATE_INFO, 0, (LPARAM)r)) delete r;
+    }).detach();
+}
+
+static void StartUpdateDownload() {
+    if (g.updateBusy || !g.hasUpdate) return;
+    g.updateBusy = true;
+    SendMessageW(g.status, SB_SETTEXTW, 0, (LPARAM)L"Завантаження оновлення…");
+    HWND target = g.main;
+    UpdateInfo info = g.update;
+    std::thread([target, info] {
+        auto* r = new UpdateFileResult();
+        r->file = DownloadSetup(info, r->path, r->error);
+        if (!PostMessageW(target, WM_APP_UPDATE_FILE, 0, (LPARAM)r)) {
+            if (r->file != INVALID_HANDLE_VALUE) CloseHandle(r->file);
+            delete r;
+        }
+    }).detach();
+}
+
+static void ShowUpdateDialog() {
+    if (!g.hasUpdate || g.updateDialogOpen) return;
+    const UpdateInfo& u = g.update;
+    bool canInstall = !u.setupUrl.empty() && !u.sha256.empty();
+
+    std::wstring instruction = L"Вийшла нова версія " + u.version;
+    std::wstring content = L"Встановлена версія: " L"" APP_VERSION_STR L"\nНова версія: " + u.version;
+    if (!u.notes.empty()) content += L"\n\n" + u.notes;
+    content += canInstall
+        ? L"\n\nПрограма завантажить інсталятор з GitHub, перевірить його контрольну суму і встановить "
+          L"оновлення. Після цього вона запуститься знову, налаштування збережуться."
+        : L"\n\nАвтоматично встановити цю версію не вийде: на GitHub немає інсталятора з контрольною сумою. "
+          L"Її можна завантажити зі сторінки на GitHub.";
+
+    TASKDIALOG_BUTTON buttons[] = {
+        { IDB_UPDATE_NOW, L"Оновити зараз" },
+        { IDB_UPDATE_PAGE, L"Сторінка на GitHub" },
+        { IDCANCEL, L"Пізніше" },
+    };
+    TASKDIALOGCONFIG tc{};
+    tc.cbSize = sizeof(tc);
+    tc.hwndParent = DialogOwner();
+    tc.hInstance = g.inst;
+    tc.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW;
+    tc.pszWindowTitle = L"Оновлення програми";
+    tc.pszMainIcon = TD_INFORMATION_ICON;
+    tc.pszMainInstruction = instruction.c_str();
+    tc.pszContent = content.c_str();
+    tc.pButtons = canInstall ? buttons : buttons + 1;
+    tc.cButtons = canInstall ? 3 : 2;
+    tc.nDefaultButton = canInstall ? IDB_UPDATE_NOW : IDB_UPDATE_PAGE;
+
+    int pressed = IDCANCEL;
+    g.updateDialogOpen = true;
+    if (FAILED(TaskDialogIndirect(&tc, &pressed, nullptr, nullptr))) pressed = IDCANCEL;
+    g.updateDialogOpen = false;
+
+    if (pressed == IDB_UPDATE_NOW) StartUpdateDownload();
+    else if (pressed == IDB_UPDATE_PAGE) OpenUrl(u.pageUrl);
+}
+
+static void OnUpdateInfo(const UpdateCheckResult& r) {
+    g.updateBusy = false;
+    if (r.manual && g.haveSnap) UpdateStatus();
+    if (!r.ok) {
+        // Автоматична перевірка без інтернету — звичайна ситуація, тож про неї не повідомляємо
+        if (r.manual)
+            MessageBoxW(DialogOwner(), (L"Не вдалося перевірити оновлення: " + r.error + L".").c_str(),
+                        L"Оновлення програми", MB_ICONWARNING | MB_SETFOREGROUND);
+        return;
+    }
+    if (CompareVersions(r.info.version, L"" APP_VERSION_STR) <= 0) {
+        g.hasUpdate = false;
+        if (r.manual)
+            MessageBoxW(DialogOwner(), L"У вас встановлена остання версія програми (" L"" APP_VERSION_STR L").",
+                        L"Оновлення програми", MB_ICONINFORMATION | MB_SETFOREGROUND);
+        return;
+    }
+
+    g.update = r.info;
+    g.hasUpdate = true;
+    if (g.updateLogged != r.info.version) {
+        g.updateLogged = r.info.version;
+        LogEvent(L"Доступна нова версія програми: " + r.info.version);
+    }
+    if (r.manual || DialogOwner()) {
+        ShowUpdateDialog();
+    } else {
+        // Програма в треї — показуємо сповіщення; клік по ньому відкриває вікно оновлення
+        TrayBalloon(L"Вийшла нова версія програми",
+                    L"Версія " + r.info.version + L" вже доступна. Клацніть тут, щоб оновити програму.", NIIF_INFO);
+        g.balloonIsUpdate = true;
+    }
+}
+
+static void OnUpdateFile(UpdateFileResult& r) {
+    g.updateBusy = false;
+    if (g.haveSnap) UpdateStatus();
+    if (r.file == INVALID_HANDLE_VALUE) {
+        LogEvent(L"Не вдалося завантажити оновлення: " + r.error);
+        std::wstring text = L"Не вдалося завантажити оновлення: " + r.error +
+                            L".\n\nВідкрити сторінку програми на GitHub, щоб завантажити нову версію вручну?";
+        if (MessageBoxW(DialogOwner(), text.c_str(), L"Оновлення програми", MB_ICONWARNING | MB_YESNO | MB_SETFOREGROUND) == IDYES)
+            OpenUrl(g.update.pageUrl);
+        return;
+    }
+
+    // Інсталятор працює в тихому режимі: показує лише смужку прогресу. Параметр /UPDATE каже йому
+    // дочекатися, поки ця копія програми закриється, і після встановлення запустити нову версію.
+    std::wstring params = L"/SILENT /SUPPRESSMSGBOXES /NORESTART /UPDATE";
+    if (!IsWindowVisible(g.main)) params += L" /TRAY";
+    SHELLEXECUTEINFOW sei{};
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOASYNC;
+    sei.hwnd = DialogOwner();
+    sei.lpVerb = L"open";
+    sei.lpFile = r.path.c_str();
+    sei.lpParameters = params.c_str();
+    sei.nShow = SW_SHOWNORMAL;
+    BOOL started = ShellExecuteExW(&sei);
+    DWORD err = GetLastError();
+    CloseHandle(r.file);   // інсталятор уже запущений, файл більше не потрібно захищати від змін
+    r.file = INVALID_HANDLE_VALUE;
+
+    if (!started) {
+        std::wstring text = err == ERROR_CANCELLED
+            ? L"Оновлення скасовано: для встановлення потрібен дозвіл у вікні контролю облікових записів (UAC)."
+            : L"Не вдалося запустити інсталятор (код помилки " + std::to_wstring(err) + L").";
+        MessageBoxW(DialogOwner(), text.c_str(), L"Оновлення програми", MB_ICONWARNING | MB_SETFOREGROUND);
+        return;
+    }
+    LogEvent(L"Встановлюється оновлення до версії " + g.update.version);
+    g.reallyExit = true;
+    DestroyWindow(g.main);   // закриваємося, щоб інсталятор міг замінити файли програми
+}
+
 static void ShowAbout() {
-    std::wstring text =
-        std::wstring(APP_TITLE) + L", версія " + L"" APP_VERSION_STR L"\n\n"
+    std::wstring instruction = std::wstring(APP_TITLE) + L", версія " + L"" APP_VERSION_STR;
+    std::wstring content =
         L"Курсовий проект на тему:\n"
-        L"«Розробка програмного застосунку для програмного моніторингу "
-        L"накопичувачів»\n\n"
+        L"«Розробка програмного застосунку для програмного моніторингу накопичувачів»\n\n"
         L"Автор: " + std::wstring(APP_AUTHOR) + L"\n\n"
         L"Дані отримуються через Windows Management Instrumentation (WMI) та SMART.\n"
-        L"Програма лише зчитує інформацію і нічого не записує на диски.";
-    MessageBoxW(g.main, text.c_str(), L"Про програму", MB_ICONINFORMATION);
+        L"Програма лише зчитує інформацію і нічого не записує на диски.\n\n"
+        L"Щоб перевірити, чи вийшла нова версія, програма раз на добу звертається до GitHub. "
+        L"Жодних даних про комп'ютер чи диски при цьому не надсилається.";
+
+    TASKDIALOG_BUTTON buttons[] = { { IDB_ABOUT_UPDATE, L"Перевірити оновлення" } };
+    TASKDIALOGCONFIG tc{};
+    tc.cbSize = sizeof(tc);
+    tc.hwndParent = g.main;
+    tc.hInstance = g.inst;
+    tc.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW;
+    tc.pszWindowTitle = L"Про програму";
+    tc.pszMainIcon = MAKEINTRESOURCEW(IDI_APP);
+    tc.pszMainInstruction = instruction.c_str();
+    tc.pszContent = content.c_str();
+    tc.pButtons = buttons;
+    tc.cButtons = 1;
+    tc.dwCommonButtons = TDCBF_OK_BUTTON;
+    tc.nDefaultButton = IDOK;
+
+    int pressed = IDOK;
+    if (SUCCEEDED(TaskDialogIndirect(&tc, &pressed, nullptr, nullptr)) && pressed == IDB_ABOUT_UPDATE)
+        StartUpdateCheck(true);
 }
 
 // ---------------------------------------------------------------------------
@@ -973,6 +1198,14 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // Дозволяємо звичайній копії програми "достукатися" до копії з правами адміністратора
         ChangeWindowMessageFilterEx(hwnd, WM_APP_SHOWME, MSGFLT_ALLOW, nullptr);
         ChangeWindowMessageFilterEx(hwnd, g.msgTaskbarCreated, MSGFLT_ALLOW, nullptr);
+        if (g.autoUpdate) SetTimer(hwnd, IDT_UPDATE, UPDATE_FIRST_MS, nullptr);
+        return 0;
+
+    case WM_TIMER:
+        if (wp == IDT_UPDATE) {
+            SetTimer(hwnd, IDT_UPDATE, UPDATE_INTERVAL_MS, nullptr);   // наступна перевірка — за добу
+            StartUpdateCheck(false);
+        }
         return 0;
 
     case WM_SIZE:
@@ -1007,6 +1240,17 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case IDC_BTN_ADMIN:   RestartAsAdmin(); break;
         case IDC_BTN_ABOUT:   ShowAbout(); break;
         case ID_TRAY_OPEN:    ShowMain(); break;
+        case ID_TRAY_UPDATE_CHECK:
+            if (g.hasUpdate) ShowUpdateDialog();
+            else StartUpdateCheck(true);
+            break;
+        case ID_TRAY_UPDATE_AUTO:
+            g.autoUpdate = !g.autoUpdate;
+            SaveAutoUpdate(g.autoUpdate);
+            if (g.autoUpdate) SetTimer(hwnd, IDT_UPDATE, UPDATE_FIRST_MS, nullptr);
+            else KillTimer(hwnd, IDT_UPDATE);
+            LogEvent(g.autoUpdate ? L"Автоматичну перевірку оновлень увімкнено" : L"Автоматичну перевірку оновлень вимкнено");
+            break;
         case ID_TRAY_EXIT:
             g.reallyExit = true;
             DestroyWindow(hwnd);
@@ -1044,10 +1288,18 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_APP_TRAY:
         if (LOWORD(lp) == WM_LBUTTONDBLCLK || LOWORD(lp) == WM_LBUTTONUP) {
             ShowMain();
+        } else if (LOWORD(lp) == NIN_BALLOONUSERCLICK && g.balloonIsUpdate) {
+            ShowMain();
+            ShowUpdateDialog();
         } else if (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_CONTEXTMENU) {
             HMENU m = CreatePopupMenu();
             AppendMenuW(m, MF_STRING, ID_TRAY_OPEN, L"Відкрити");
             AppendMenuW(m, MF_STRING, ID_TRAY_REFRESH, L"Перевірити диски зараз");
+            AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(m, MF_STRING, ID_TRAY_UPDATE_CHECK,
+                        g.hasUpdate ? L"Встановити нову версію…" : L"Перевірити оновлення");
+            AppendMenuW(m, MF_STRING | (g.autoUpdate ? MF_CHECKED : 0), ID_TRAY_UPDATE_AUTO,
+                        L"Перевіряти оновлення автоматично");
             AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(m, MF_STRING, ID_TRAY_EXIT, L"Вихід");
             SetMenuDefaultItem(m, ID_TRAY_OPEN, FALSE);
@@ -1064,6 +1316,18 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ShowMain();
         return 0;
 
+    case WM_APP_UPDATE_INFO: {
+        std::unique_ptr<UpdateCheckResult> r((UpdateCheckResult*)lp);
+        OnUpdateInfo(*r);
+        return 0;
+    }
+
+    case WM_APP_UPDATE_FILE: {
+        std::unique_ptr<UpdateFileResult> r((UpdateFileResult*)lp);
+        OnUpdateFile(*r);
+        return 0;
+    }
+
     case WM_CLOSE:
         if (!g.reallyExit) {   // хрестик згортає програму в трей
             HideToTray();
@@ -1076,6 +1340,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
 
     case WM_DESTROY:
+        KillTimer(hwnd, IDT_UPDATE);
         TrayRemove();
         SetEvent(g_evStop);
         if (g_worker.joinable()) g_worker.join();
@@ -1113,6 +1378,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int nShow) {
 
     g.inst = inst;
     g.isAdmin = IsRunningAsAdmin();
+    g.autoUpdate = LoadAutoUpdate();
     g.msgTaskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
