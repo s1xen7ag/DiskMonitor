@@ -124,6 +124,8 @@ struct AppState {
     // Оновлення програми
     bool autoUpdate = true;          // перевіряти оновлення раз на добу
     bool updateBusy = false;         // зараз іде перевірка або завантаження
+    bool updateWantManual = false;   // користувач попросив перевірку, поки йшла автоматична
+    bool updateWantInstall = false;  // користувач натиснув «Оновити зараз», поки йшла перевірка
     bool updateDialogOpen = false;
     bool balloonIsUpdate = false;    // останнє сповіщення в треї — про нову версію
     bool hasUpdate = false;          // знайдено новішу версію
@@ -567,17 +569,19 @@ static void FillSmartList(HWND lv, const PhysicalDisk& d) {
         } else if ((a.id == 5 || a.id == 197 || a.id == 198) && (a.raw & 0xFFFFFFFF) > 0) {
             h = Health::Warning; mark = L"Увага";
         }
-
-        std::wstring raw = FormatNumber((long long)a.raw);
-        if (a.id == 194 || a.id == 190) raw = std::to_wstring(a.raw & 0xFF) + L" °C";
-        if (a.id == 9) raw = FormatNumber((long long)(a.raw & 0xFFFFFFFF)) + L" год";
+        // Атрибут, з якого взято ресурс SSD: оцінка така сама, як у висновку про знос
+        if (a.id == d.wearAttr && d.wear >= 0) {
+            Health wh = d.wear >= 90 ? Health::Critical : d.wear >= 70 ? Health::Warning : Health::Good;
+            h = std::max(h, wh);
+            mark = L"Ресурс " + std::to_wstring(std::max(0, 100 - d.wear)) + L"%";
+        }
 
         wchar_t hex[8];
         swprintf(hex, 8, L"%02X", a.id);
         SetRow(lv, row++, {
             std::wstring(hex) + L" (" + std::to_wstring(a.id) + L")",
-            SmartAttrName(a.id), std::to_wstring(a.current), std::to_wstring(a.worst),
-            a.threshold >= 0 ? std::to_wstring(a.threshold) : L"—", raw, mark
+            SmartAttrName(d, a.id), std::to_wstring(a.current), std::to_wstring(a.worst),
+            a.threshold >= 0 ? std::to_wstring(a.threshold) : L"—", FormatSmartRaw(d, a), mark
         }, (LPARAM)h);
     }
 }
@@ -613,7 +617,7 @@ static void FillNvmeList(HWND lv, const PhysicalDisk& d) {
         std::to_wstring(d.wear) + L"%  (залишилось " + std::to_wstring(std::max(0, 100 - d.wear)) + L"%)",
         wh, wh == Health::Critical ? L"Критично" : wh == Health::Warning ? L"Увага" : L"OK");
 
-    bool spareLow = d.nvmeSpareThreshold > 0 && d.nvmeSpare <= d.nvmeSpareThreshold;
+    bool spareLow = d.nvmeSpareThreshold > 0 && d.nvmeSpare < d.nvmeSpareThreshold;
     add(L"Доступний резерв (Available Spare)",
         std::to_wstring(d.nvmeSpare) + L"%  (поріг " + std::to_wstring(d.nvmeSpareThreshold) + L"%)",
         spareLow ? Health::Critical : Health::Good, spareLow ? L"Критично" : L"OK");
@@ -755,11 +759,11 @@ static std::wstring BuildReport() {
             r += L"  ID   Атрибут                              Поточне Найгірше Поріг  Значення" + nl;
             for (auto& a : d.smart) {
                 wchar_t buf[256];
-                std::wstring name = SmartAttrName(a.id);
+                std::wstring name = SmartAttrName(d, a.id);
                 if (name.size() > 36) name = name.substr(0, 36);
                 swprintf(buf, 256, L"  %3d  %-36ls %7d %8d %5ls  %ls", a.id, name.c_str(), a.current, a.worst,
                          a.threshold >= 0 ? std::to_wstring(a.threshold).c_str() : L"—",
-                         FormatNumber((long long)a.raw).c_str());
+                         FormatSmartRaw(d, a).c_str());
                 r += buf + nl;
             }
         }
@@ -896,7 +900,10 @@ struct UpdateFileResult {
 
 // Запит до GitHub виконується у фоновому потоці, щоб вікно не чекало на відповідь сервера
 static void StartUpdateCheck(bool manual) {
-    if (g.updateBusy) return;
+    if (g.updateBusy) {               // результат поточної перевірки покажемо як для ручної
+        if (manual) g.updateWantManual = true;
+        return;
+    }
     g.updateBusy = true;
     if (manual) SendMessageW(g.status, SB_SETTEXTW, 0, (LPARAM)L"Перевірка оновлень…");
     HWND target = g.main;
@@ -909,7 +916,11 @@ static void StartUpdateCheck(bool manual) {
 }
 
 static void StartUpdateDownload() {
-    if (g.updateBusy || !g.hasUpdate) return;
+    if (!g.hasUpdate) return;
+    if (g.updateBusy) {               // завантажимо, щойно завершиться поточна перевірка
+        g.updateWantInstall = true;
+        return;
+    }
     g.updateBusy = true;
     SendMessageW(g.status, SB_SETTEXTW, 0, (LPARAM)L"Завантаження оновлення…");
     HWND target = g.main;
@@ -967,29 +978,40 @@ static void ShowUpdateDialog() {
 
 static void OnUpdateInfo(const UpdateCheckResult& r) {
     g.updateBusy = false;
-    if (r.manual && g.haveSnap) UpdateStatus();
+    // Поки йшла перевірка, користувач міг попросити перевірку вручну або натиснути «Оновити зараз»
+    bool manual = r.manual || g.updateWantManual;
+    bool install = g.updateWantInstall;
+    g.updateWantManual = g.updateWantInstall = false;
+    if (manual && g.haveSnap) UpdateStatus();
+
+    if (r.ok) {
+        g.hasUpdate = CompareVersions(r.info.version, L"" APP_VERSION_STR) > 0;
+        if (g.hasUpdate) {
+            g.update = r.info;
+            if (g.updateLogged != r.info.version) {
+                g.updateLogged = r.info.version;
+                LogEvent(L"Доступна нова версія програми: " + r.info.version);
+            }
+        }
+    }
+    if (install && g.hasUpdate) {
+        StartUpdateDownload();
+        return;
+    }
     if (!r.ok) {
         // Автоматична перевірка без інтернету — звичайна ситуація, тож про неї не повідомляємо
-        if (r.manual)
+        if (manual)
             MessageBoxW(DialogOwner(), (L"Не вдалося перевірити оновлення: " + r.error + L".").c_str(),
                         L"Оновлення програми", MB_ICONWARNING | MB_SETFOREGROUND);
         return;
     }
-    if (CompareVersions(r.info.version, L"" APP_VERSION_STR) <= 0) {
-        g.hasUpdate = false;
-        if (r.manual)
+    if (!g.hasUpdate) {
+        if (manual)
             MessageBoxW(DialogOwner(), L"У вас встановлена остання версія програми (" L"" APP_VERSION_STR L").",
                         L"Оновлення програми", MB_ICONINFORMATION | MB_SETFOREGROUND);
         return;
     }
-
-    g.update = r.info;
-    g.hasUpdate = true;
-    if (g.updateLogged != r.info.version) {
-        g.updateLogged = r.info.version;
-        LogEvent(L"Доступна нова версія програми: " + r.info.version);
-    }
-    if (r.manual || DialogOwner()) {
+    if (manual || DialogOwner()) {
         ShowUpdateDialog();
     } else {
         // Програма в треї — показуємо сповіщення; клік по ньому відкриває вікно оновлення
@@ -1001,6 +1023,7 @@ static void OnUpdateInfo(const UpdateCheckResult& r) {
 
 static void OnUpdateFile(UpdateFileResult& r) {
     g.updateBusy = false;
+    g.updateWantManual = g.updateWantInstall = false;   // натискання під час завантаження не повторюємо
     if (g.haveSnap) UpdateStatus();
     if (r.file == INVALID_HANDLE_VALUE) {
         LogEvent(L"Не вдалося завантажити оновлення: " + r.error);
@@ -1335,15 +1358,33 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         break;
 
-    case WM_ENDSESSION:        // вимкнення комп'ютера
-        if (wp) { g.reallyExit = true; LogEvent(L"Завершення роботи Windows"); }
+    case WM_ENDSESSION:
+        if (wp) {
+            g.reallyExit = true;
+            if (lp & ENDSESSION_CLOSEAPP) {
+                // Інсталятор (через Restart Manager) просить закрити програму, щоб замінити її файли
+                LogEvent(L"Програму закрито на запит інсталятора");
+                DestroyWindow(hwnd);
+            } else {
+                LogEvent(L"Завершення роботи Windows");   // вимкнення комп'ютера
+            }
+        }
         return 0;
 
     case WM_DESTROY:
         KillTimer(hwnd, IDT_UPDATE);
         TrayRemove();
         SetEvent(g_evStop);
-        if (g_worker.joinable()) g_worker.join();
+        // Фоновий потік зупиняється між запитами. Якщо запит до несправного диска «завис»,
+        // не чекаємо безкінечно: інакше програма не закрилася б, тримала б mutex і не давала
+        // інсталятору оновлення замінити свої файли.
+        if (g_worker.joinable()) {
+            if (WaitForSingleObject((HANDLE)g_worker.native_handle(), 10000) != WAIT_OBJECT_0) {
+                LogEvent(L"Програму закрито примусово: запит до диска не відповідав");
+                TerminateProcess(GetCurrentProcess(), 0);
+            }
+            g_worker.join();
+        }
         LogEvent(L"Програму закрито");
         PostQuitMessage(0);
         return 0;
@@ -1450,7 +1491,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR cmdLine, int nShow) {
     } else {
         ShowWindow(hwnd, nShow);
         UpdateWindow(hwnd);
-        g_visible = true;
+        g_visible = !IsIconic(hwnd);   // ярлик може запускати програму згорнутою
     }
     g_worker = std::thread(WorkerThread, hwnd);
 

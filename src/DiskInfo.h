@@ -38,6 +38,7 @@ struct PhysicalDisk {
     int temperature = -1;
     int wear = -1;                  // використаний ресурс SSD, %
     std::wstring wearSource;        // звідки взято знос SSD: журнал NVMe, атрибут SMART або Windows
+    int wearAttr = 0;               // номер атрибута SMART, з якого взято знос (0 — не з SMART)
     long long powerOnHours = -1;
     long long powerCycles = -1;
     long long reallocated = -1;     // перепризначені сектори (SMART 5)
@@ -145,5 +146,7 @@ std::wstring HealthName(Health h);
 std::wstring FormatSize(uint64_t bytes);
 std::wstring FormatNumber(long long n);
 std::wstring SmartAttrName(int id);
+std::wstring SmartAttrName(const PhysicalDisk& d, int id);                    // з урахуванням типу диска
+std::wstring FormatSmartRaw(const PhysicalDisk& d, const SmartAttribute& a);  // сире значення для таблиці і звіту
 std::wstring DiskDescription(const PhysicalDisk& d);   // текстовий опис для вікна деталей і звіту
 bool IsRunningAsAdmin();

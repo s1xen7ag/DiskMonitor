@@ -14,6 +14,7 @@
 #include <windows.h>
 #include <winhttp.h>
 #include <bcrypt.h>
+#include <sddl.h>
 
 #include "Updater.h"
 #include "resource.h"
@@ -29,6 +30,7 @@
 #ifdef _MSC_VER
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "bcrypt.lib")
+#pragma comment(lib, "advapi32.lib")
 #endif
 
 #ifndef WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY
@@ -404,6 +406,56 @@ std::wstring Sha256Hex(const void* data, size_t size) {
     return hex;
 }
 
+bool IsElevated() {
+    HANDLE token = nullptr;
+    TOKEN_ELEVATION e{};
+    DWORD size = 0;
+    bool elevated = OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) &&
+                    GetTokenInformation(token, TokenElevation, &e, sizeof(e), &size) && e.TokenIsElevated;
+    if (token) CloseHandle(token);
+    return elevated;
+}
+
+// Папка для завантаженого інсталятора.
+// Копія з правами адміністратора запускає інсталятор теж з цими правами, а він читає свій файл
+// уже після того, як програма закрилася. Тому файл кладеться в нову папку в C:\Windows\Temp,
+// доступну лише адміністраторам і системі: звичайна програма того самого користувача не зможе
+// його підмінити (у власній папці %TEMP% користувач може перейменувати будь-що).
+std::wstring MakeDownloadDir() {
+    if (!IsElevated()) {
+        wchar_t temp[MAX_PATH] = L"";
+        GetTempPathW(MAX_PATH, temp);
+        std::wstring dir = std::wstring(temp) + L"DiskMonitor_Update";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        return dir;
+    }
+
+    wchar_t win[MAX_PATH] = L"";
+    GetWindowsDirectoryW(win, MAX_PATH);
+    // Старі папки тут не видаляються: програма з правами адміністратора не має нічого видаляти
+    // за шляхами, які міг підготувати хтось інший. C:\Windows\Temp очищує сама Windows.
+    std::wstring base = std::wstring(win) + L"\\Temp\\";
+
+    // Повний доступ — лише адміністраторам (BA) і системі (SY), без успадкування дозволів
+    PSECURITY_DESCRIPTOR sd = nullptr;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;OICI;FA;;;BA)(A;OICI;FA;;;SY)",
+                                                              SDDL_REVISION_1, &sd, nullptr))
+        return L"";
+    SECURITY_ATTRIBUTES sa{ sizeof(sa), sd, FALSE };
+    std::wstring result;
+    for (int attempt = 0; attempt < 5 && result.empty(); ++attempt) {
+        UCHAR rnd[8] = {};
+        BCryptGenRandom(nullptr, rnd, sizeof(rnd), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        wchar_t name[64];
+        swprintf(name, 64, L"DiskMonitor_Update_%02x%02x%02x%02x%02x%02x%02x%02x",
+                 rnd[0], rnd[1], rnd[2], rnd[3], rnd[4], rnd[5], rnd[6], rnd[7]);
+        // Нова папка з унікальною назвою: якщо така вже існує, її створив хтось інший — не беремо
+        if (CreateDirectoryW((base + name).c_str(), &sa)) result = base + name;
+    }
+    LocalFree(sd);
+    return result;
+}
+
 bool ReadWholeFile(HANDLE f, std::string& data) {
     LARGE_INTEGER size{};
     if (!GetFileSizeEx(f, &size) || size.QuadPart > (LONGLONG)kMaxSetupBytes) return false;
@@ -446,10 +498,11 @@ HANDLE DownloadSetup(const UpdateInfo& info, std::wstring& path, std::wstring& e
         return INVALID_HANDLE_VALUE;
     }
 
-    wchar_t temp[MAX_PATH] = L"";
-    GetTempPathW(MAX_PATH, temp);
-    std::wstring dir = std::wstring(temp) + L"DiskMonitor_Update";
-    CreateDirectoryW(dir.c_str(), nullptr);
+    std::wstring dir = MakeDownloadDir();
+    if (dir.empty()) {
+        error = L"не вдалося створити тимчасову папку";
+        return INVALID_HANDLE_VALUE;
+    }
     path = dir + L"\\" + SafeFileName(info.setupName);
 
     HANDLE f = CreateFileW(path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);

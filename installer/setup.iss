@@ -6,7 +6,7 @@
 ; ============================================================================
 
 #define MyAppName      "Монітор стану дисків"
-#define MyAppVersion   "1.2"
+#define MyAppVersion   "1.3"
 #define MyAppPublisher "Кирилюк Микола"
 #define MyAppExe       "DiskMonitor.exe"
 ; Іменований mutex, який створює запущена програма (див. kMutexName у main.cpp)
@@ -50,7 +50,7 @@ WizardStyle=modern
 Compression=lzma2/max
 SolidCompression=yes
 
-VersionInfoVersion=1.2.0.0
+VersionInfoVersion=1.3.0.0
 VersionInfoDescription=Інсталятор програми «{#MyAppName}»
 VersionInfoProductName={#MyAppName}
 
@@ -183,7 +183,8 @@ begin
     Result := Result + ' /tray';
 end;
 
-// Чекає, поки програма закриється. Під час оновлення вона закривається сама (до 30 с),
+// Чекає, поки програма закриється. Під час оновлення вона закривається сама (до 2 хв: стара
+// версія чекає, поки фоновий потік завершить поточний запит WMI, а він може тривати довго),
 // інакше користувача просять закрити її, як це робить стандартна перевірка AppMutex.
 function WaitForAppClosed(Msg: String): Boolean;
 var
@@ -193,7 +194,7 @@ begin
   begin
     Log('Автоматичне оновлення: чекаємо, поки програма закриється');
     I := 0;
-    while CheckForMutexes('{#MyAppMutex}') and (I < 60) do
+    while CheckForMutexes('{#MyAppMutex}') and (I < 240) do
     begin
       Sleep(500);
       I := I + 1;

@@ -224,15 +224,23 @@ bool Contains(const std::wstring& text, const wchar_t* what) {
     return Upper(text).find(what) != std::wstring::npos;
 }
 
-// Залишок ресурсу SATA SSD за SMART, % (1..100) або -1, якщо диск його не повідомляє.
+// SSD на контролері Phison (так само Kingston A400): впізнається за характерним набором атрибутів
+bool IsPhisonLike(const PhysicalDisk& d) {
+    for (int id : { 168, 170, 173, 218, 231 })
+        if (!FindAttr(d, id)) return false;
+    return true;
+}
+
+// Залишок ресурсу SATA SSD за SMART, % (0..100) або -1, якщо диск його не повідомляє.
 // Атрибути SMART не стандартизовані: той самий номер у різних виробників означає різне, а залишок
 // ресурсу одні контролери записують у нормалізоване значення атрибута, інші — у «сире». Тому
 // правило вибирається за виробником (назвою моделі) або за набором атрибутів, характерним для
 // контролера. Правила узгоджені з тим, як ресурс читає програма CrystalDiskInfo.
-// how — звідки взято значення (показується у вікні деталей).
-int SsdLifeFromSmart(const PhysicalDisk& d, std::wstring& how) {
+// how — звідки взято значення (показується у вікні деталей), attr — номер цього атрибута.
+int SsdLifeFromSmart(const PhysicalDisk& d, std::wstring& how, int& attr) {
     auto source = [&](int id, const wchar_t* name, const wchar_t* field) {
         how = L"атрибут SMART " + std::to_wstring(id) + L" («" + name + L"», " + field + L")";
+        attr = id;
     };
     // Залишок у нормалізованому значенні атрибута (100 — новий диск)
     auto normalized = [&](int id, const wchar_t* name) -> int {
@@ -264,10 +272,11 @@ int SsdLifeFromSmart(const PhysicalDisk& d, std::wstring& how) {
     if (Contains(d.model, L"INTEL"))
         return normalized(233, L"Media Wearout Indicator");
     if (startsWith(L"WDC ") || startsWith(L"WD ") || Contains(d.model, L"SANDISK")) {
-        // WD і SanDisk записують використаний ресурс у другий байт сирого значення атрибута 230
+        // WD і SanDisk записують використаний ресурс у другий байт сирого значення атрибута 230.
+        // Після вичерпання заявленого ресурсу він може перевищити 100 — тоді залишок 0 %
         auto a = FindAttr(d, 230);
-        int used = a ? (int)((a->raw >> 8) & 0xFF) : -1;
-        if (used < 0 || used >= 100) return -1;
+        if (!a) return -1;
+        int used = std::min(100, (int)((a->raw >> 8) & 0xFF));
         source(230, L"Media Wearout Indicator", L"сире значення");
         return 100 - used;
     }
@@ -292,7 +301,7 @@ int SsdLifeFromSmart(const PhysicalDisk& d, std::wstring& how) {
     if (has({ 160, 161, 163, 169 }))
         return rawPercent(169, L"Remaining Life");
     // Контролери Phison (Patriot, Goodram, PNY та ін.): сире значення атрибута 231
-    if (has({ 168, 170, 173, 218, 231 }))
+    if (IsPhisonLike(d))
         return rawPercent(231, L"SSD Life Left");
     // Інші (SandForce, SK hynix тощо): атрибут 231 у нормалізованому значенні
     return normalized(231, L"SSD Life Left");
@@ -314,6 +323,7 @@ void FinishDisk(PhysicalDisk& d) {
         }
     }
     if (d.isSsd && d.bus == L"NVMe") d.type = L"SSD (NVMe)";
+    if (!d.isSsd) d.wear = -1;   // лічильник зносу Windows має сенс лише для SSD
 
     if (d.temperature < 0) {
         const SmartAttribute* t = FindAttr(d, 194);
@@ -335,16 +345,19 @@ void FinishDisk(PhysicalDisk& d) {
     // виробника (див. SsdLifeFromSmart). Лічильник надійності Windows для багатьох SATA SSD
     // повертає 0 навіть тоді, коли накопичувач знос не повідомляє, тому сам по собі цей 0
     // не означає «100 % ресурсу».
+    d.wearAttr = 0;
     if (d.hasNvmeLog) {
         d.wearSource = L"журнал стану NVMe (Percentage Used)";
     } else if (d.isSsd) {
         int wmiWear = d.wear;
         std::wstring how;
-        int life = SsdLifeFromSmart(d, how);
+        int attr = 0;
+        int life = SsdLifeFromSmart(d, how, attr);
         int smartWear = life >= 0 ? 100 - life : -1;
         if (smartWear >= 0 && smartWear >= wmiWear) {
             d.wear = smartWear;
             d.wearSource = how;
+            d.wearAttr = attr;
         } else if (wmiWear > 0) {
             d.wear = wmiWear;
             d.wearSource = L"лічильник надійності Windows";
@@ -530,7 +543,9 @@ void WmiReader::ReadStorageInfo(Snapshot& s) {
             long long t = GetNum(o, L"Temperature");
             if (t > 0 && t < 120) d->temperature = (int)t;
             long long w = GetNum(o, L"Wear");
-            if (w >= 0 && w <= 100 && d->isSsd) d->wear = (int)w;
+            // Тип диска ще може уточнитися у FinishDisk (за SMART або назвою моделі), тому знос
+            // запам'ятовуємо завжди, а для дисків, які виявляться не SSD, FinishDisk його скине
+            if (w >= 0 && w <= 100) d->wear = (int)w;
             long long hrs = GetNum(o, L"PowerOnHours");
             if (hrs > 0) d->powerOnHours = hrs;
             d->readErrors = GetNum(o, L"ReadErrorsTotal");
@@ -554,7 +569,9 @@ void WmiReader::ReadSmart(Snapshot& s) {
     Query(wmi_, L"SELECT InstanceName, VendorSpecific FROM MSStorageDriver_FailurePredictData",
         [&](IWbemClassObject* o) {
             PhysicalDisk* d = FindByPnp(s, GetStr(o, L"InstanceName"));
-            if (!d) return;
+            // Таблиця атрибутів у форматі ATA існує лише для SATA/ATA-дисків; дані NVMe мають
+            // інший формат і читаються з журналу стану NVMe
+            if (!d || d->bus == L"NVMe") return;
             std::vector<uint8_t> b = GetBytes(o, L"VendorSpecific");
             d->smart.clear();
             for (int i = 0; i < 30; ++i) {
@@ -743,11 +760,11 @@ void AnalyzeDisk(PhysicalDisk& d) {
         if (a.threshold > 0 && a.current > 0 && a.current <= a.threshold) {
             if (a.flags & 0x01) {
                 critical = true;
-                d.notes.push_back(L"Критичний атрибут SMART «" + SmartAttrName(a.id) +
+                d.notes.push_back(L"Критичний атрибут SMART «" + SmartAttrName(d, a.id) +
                                   L"» опустився до порогового значення. Можлива скора відмова диска.");
             } else {
                 warning = true;
-                d.notes.push_back(L"Атрибут SMART «" + SmartAttrName(a.id) +
+                d.notes.push_back(L"Атрибут SMART «" + SmartAttrName(d, a.id) +
                                   L"» досяг порогового значення (атрибут старіння: знос або перевищення робочих умов).");
             }
         }
@@ -771,7 +788,8 @@ void AnalyzeDisk(PhysicalDisk& d) {
     // Критичні попередження, які NVMe-накопичувач повідомляє сам про себе
     if (d.hasNvmeLog) {
         int cw = d.nvmeCriticalWarning;
-        if ((cw & 0x01) || (d.nvmeSpare >= 0 && d.nvmeSpareThreshold > 0 && d.nvmeSpare <= d.nvmeSpareThreshold)) {
+        // За стандартом NVMe тривога — коли резерв опустився НИЖЧЕ порогу
+        if ((cw & 0x01) || (d.nvmeSpare >= 0 && d.nvmeSpareThreshold > 0 && d.nvmeSpare < d.nvmeSpareThreshold)) {
             critical = true;
             d.notes.push_back(L"Резервні блоки SSD майже закінчились (залишилось " + std::to_wstring(d.nvmeSpare) + L"%).");
         }
@@ -903,6 +921,25 @@ std::wstring SmartAttrName(int id) {
     return it != names.end() ? it->second : L"Специфічний атрибут виробника";
 }
 
+// Назви вище — для жорстких дисків; у SSD деякі номери означають інше
+std::wstring SmartAttrName(const PhysicalDisk& d, int id) {
+    if (d.isSsd) {
+        if (id == 173 && IsPhisonLike(d)) return L"Стирання блоків (сер. / макс.)";
+        if (id == 230) return L"Індикатор зносу носія";
+    }
+    return SmartAttrName(id);
+}
+
+std::wstring FormatSmartRaw(const PhysicalDisk& d, const SmartAttribute& a) {
+    if (a.id == 194 || a.id == 190) return std::to_wstring(a.raw & 0xFF) + L" °C";
+    if (a.id == 9) return FormatNumber((long long)(a.raw & 0xFFFFFFFF)) + L" год";
+    // Kingston A400 і контролери Phison записують в атрибут 173 два числа: у молодших 16 бітах —
+    // найбільшу, у наступних 16 — середню кількість стирань блоків флеш-пам'яті
+    if (a.id == 173 && d.isSsd && IsPhisonLike(d))
+        return FormatNumber((long long)((a.raw >> 16) & 0xFFFF)) + L" / " + FormatNumber((long long)(a.raw & 0xFFFF));
+    return FormatNumber((long long)a.raw);
+}
+
 std::wstring DiskDescription(const PhysicalDisk& d) {
     const std::wstring nl = L"\r\n";
     const std::wstring na = L"немає даних";
@@ -933,6 +970,11 @@ std::wstring DiskDescription(const PhysicalDisk& d) {
     if (d.type == L"HDD") {
         if (d.hddHealth >= 0) {
             t += Pad(L"Індекс механічного стану") + std::to_wstring(d.hddHealth) + L"% (оцінка програми)" + nl;
+            // Атрибути, з яких рахується індекс (див. ComputeHddHealth), — ті, що є в цього диска
+            std::wstring ids;
+            for (int id : { 5, 197, 198, 187, 10, 193, 4, 9 })
+                if (FindAttr(d, id)) ids += (ids.empty() ? L"" : L", ") + std::to_wstring(id);
+            t += Pad(L"Джерело даних") + L"атрибути SMART " + ids + L"; розрахунок:" + nl;
             if (d.hddHealthDetails.empty()) t += L"    ознак механічного зносу не виявлено" + nl;
             for (auto& s : d.hddHealthDetails) t += L"    " + s + nl;
         } else {
