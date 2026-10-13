@@ -26,7 +26,7 @@
 
 ## Встановлення
 
-1. Завантажте `DiskMonitor_Setup_1.3.exe` зі сторінки [Releases](https://github.com/s1xen7ag/DiskMonitor/releases/latest).
+1. Завантажте `DiskMonitor_Setup_1.4.exe` зі сторінки [Releases](https://github.com/s1xen7ag/DiskMonitor/releases/latest).
 2. Запустіть інсталятор. Якщо Windows покаже вікно «Windows захистила ваш ПК», натисніть **«Докладніше» → «Виконати в будь-якому разі»**. Так буває з будь-якою програмою без платного цифрового підпису.
 3. За бажанням позначте **«Запускати програму автоматично при старті Windows»** — тоді програма постійно стежитиме за дисками з трею.
 
@@ -81,6 +81,7 @@
 | Kingston A400 | атрибут 231, сире значення (для прошивки 03070009 — нормалізоване) |
 | Інші Kingston | атрибут 231 або 169, нормалізоване значення |
 | контролери Silicon Motion (ADATA, Silicon Power, Transcend…) | атрибут 169, сире значення |
+| контролери Realtek (наприклад, AGI AI138) | атрибут 169, нормалізоване значення |
 | контролери Phison (Patriot, Goodram, PNY…) | атрибут 231, сире значення |
 | інші | атрибут 231, нормалізоване значення |
 
@@ -130,7 +131,7 @@
 2. Відкрийте `DiskMonitor.sln`, виберіть конфігурацію **Release | x64** і зберіть рішення (Ctrl+Shift+B).
 3. Готовий файл: `bin\DiskMonitor.exe`. Він зібраний зі статичним середовищем виконання і не потребує Visual C++ Redistributable.
 
-**Інсталятор:** встановіть [Inno Setup](https://jrsoftware.org/isdl.php) 6.3 або новіший, відкрийте `installer\setup.iss` і натисніть Build → Compile (Ctrl+F9). Результат: `Output\DiskMonitor_Setup_1.3.exe`.
+**Інсталятор:** встановіть [Inno Setup](https://jrsoftware.org/isdl.php) 6.3 або новіший, відкрийте `installer\setup.iss` і натисніть Build → Compile (Ctrl+F9). Результат: `Output\DiskMonitor_Setup_1.4.exe`.
 
 **Без Visual Studio:** встановіть [MSYS2](https://www.msys2.org/), у терміналі MSYS2 UCRT64 виконайте `pacman -S mingw-w64-ucrt-x86_64-gcc`, додайте `C:\msys64\ucrt64\bin` у PATH і запустіть `build_mingw.bat`.
 

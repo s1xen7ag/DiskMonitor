@@ -300,6 +300,10 @@ int SsdLifeFromSmart(const PhysicalDisk& d, std::wstring& how, int& attr) {
     // Контролери Silicon Motion (ADATA, Silicon Power, Transcend та ін.): сире значення атрибута 169
     if (has({ 160, 161, 163, 169 }))
         return rawPercent(169, L"Remaining Life");
+    // Контролери Realtek (наприклад, AGI AI138): атрибут 169, нормалізоване значення.
+    // Впізнаються за атрибутами 161–167 без атрибута 160, який є в Silicon Motion
+    if (has({ 161, 162, 163, 164, 166, 167, 169 }) && !FindAttr(d, 160))
+        return normalized(169, L"Remaining Life");
     // Контролери Phison (Patriot, Goodram, PNY та ін.): сире значення атрибута 231
     if (IsPhisonLike(d))
         return rawPercent(231, L"SSD Life Left");
