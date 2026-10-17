@@ -1,0 +1,57 @@
+# Автоматична збірка програми та інсталятора з вихідного коду (GitHub Actions).
+# Запускається після кожної зміни в гілці main, для тегів версій (v1.5 тощо) і вручну.
+# Готові файли зберігаються як артефакти запуску: Actions → потрібний запуск → Artifacts.
+
+name: Build
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Get source code
+        uses: actions/checkout@v4
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build DiskMonitor.exe
+        shell: pwsh
+        run: |
+          # Проєкт створено у Visual Studio 2026 (набір інструментів v145). Якщо на сервері
+          # стоїть Visual Studio 2022, збираємо набором v143 — код від цього не залежить.
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $version = & $vswhere -latest -products * -requires Microsoft.Component.MSBuild -property installationVersion
+          $toolset = if ([int]$version.Split('.')[0] -ge 18) { 'v145' } else { 'v143' }
+          Write-Host "Visual Studio $version, toolset $toolset"
+          msbuild DiskMonitor.sln /m /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=$toolset
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          (Get-Item bin\DiskMonitor.exe).VersionInfo | Format-List FileVersion, ProductName
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" installer\setup.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-FileHash Output\*.exe -Algorithm SHA256 | Format-List Path, Hash
+
+      - name: Upload build results
+        uses: actions/upload-artifact@v4
+        with:
+          name: DiskMonitor
+          path: |
+            bin/DiskMonitor.exe
+            Output/*.exe
+          if-no-files-found: error

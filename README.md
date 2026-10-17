@@ -4,10 +4,14 @@
 ![C++17](https://img.shields.io/badge/C%2B%2B-17-00599C?logo=cplusplus&logoColor=white)
 ![Win32 API](https://img.shields.io/badge/UI-Win32%20API-555555)
 [![Release](https://img.shields.io/github/v/release/s1xen7ag/DiskMonitor?label=%D0%B2%D0%B5%D1%80%D1%81%D1%96%D1%8F)](https://github.com/s1xen7ag/DiskMonitor/releases/latest)
+[![Build](https://github.com/s1xen7ag/DiskMonitor/actions/workflows/build.yml/badge.svg)](https://github.com/s1xen7ag/DiskMonitor/actions/workflows/build.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
 Програма для Windows, яка стежить за станом жорстких дисків (HDD) і твердотільних накопичувачів (SSD). Вона показує температуру, напрацювання, знос SSD, SMART-атрибути, заповненість розділів і активність дисків у реальному часі, а також попереджає, коли з диском щось не так.
 
 Програма **лише читає** інформацію і нічого не записує на диски.
+
+*In English:* DiskMonitor is a lightweight Windows 10/11 disk health monitor for HDD, SATA SSD and NVMe drives. It reads S.M.A.R.T. data and the NVMe health log, explains in plain language why a drive is considered healthy or not, tracks free space and live disk activity, and warns from the system tray when a drive's state gets worse. It only reads data and never writes to disks. The user interface is in Ukrainian.
 
 ### [Завантажити інсталятор](https://github.com/s1xen7ag/DiskMonitor/releases/latest)
 
@@ -133,6 +137,8 @@
 
 **Інсталятор:** встановіть [Inno Setup](https://jrsoftware.org/isdl.php) 6.3 або новіший, відкрийте `installer\setup.iss` і натисніть Build → Compile (Ctrl+F9). Результат: `Output\DiskMonitor_Setup_1.4.exe`.
 
+**Автоматична збірка:** після кожної зміни в репозиторії GitHub Actions сам збирає програму та інсталятор з вихідного коду ([build.yml](.github/workflows/build.yml)). Готові файли можна завантажити зі сторінки запуску в розділі **Actions → Artifacts**.
+
 **Без Visual Studio:** встановіть [MSYS2](https://www.msys2.org/), у терміналі MSYS2 UCRT64 виконайте `pacman -S mingw-w64-ucrt-x86_64-gcc`, додайте `C:\msys64\ucrt64\bin` у PATH і запустіть `build_mingw.bat`.
 
 ## Структура проєкту
@@ -141,6 +147,8 @@
 DiskMonitor/
 ├── DiskMonitor.sln, DiskMonitor.vcxproj   проєкт Visual Studio
 ├── build_mingw.bat                          збірка через MinGW
+├── LICENSE                                  ліцензія MIT
+├── .github/workflows/build.yml              автоматична збірка (GitHub Actions)
 ├── src/
 │   ├── main.cpp            інтерфейс: вікно, таблиці, трей, звіт, журнал
 │   ├── DiskInfo.h / .cpp   WMI, SMART, журнал NVMe, аналіз стану
@@ -159,8 +167,25 @@ DiskMonitor/
 - **Температура чи SMART показують «—».** Запустіть програму з правами адміністратора. NVMe у режимі RAID (Intel RST) або в USB-кишені може не віддавати журнал стану. У USB-флешок даних про стан зазвичай немає взагалі.
 - **Порожня таблиця активності.** Лічильники продуктивності Windows вимкнені або пошкоджені. Відновити їх можна командою `lodctr /r` у командному рядку від імені адміністратора.
 
-## Автор
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
+
+- Committers and reviewers: [Mykola Kyryliuk (s1xen7ag)](https://github.com/s1xen7ag)
+- Approvers: [Mykola Kyryliuk (s1xen7ag)](https://github.com/s1xen7ag)
+
+Release binaries are built from this repository by GitHub Actions ([build.yml](.github/workflows/build.yml)), and every release is approved manually before it is signed.
+
+Безкоштовний цифровий підпис надає SignPath.io, сертифікат — SignPath Foundation. Інсталятори збираються з цього репозиторію автоматично, а кожен випуск перед підписом підтверджує автор. *Статус: заявку на підпис подано; до її схвалення інсталятори не підписані.*
+
+## Privacy policy
+
+This program does not collect or send any information about your computer or disks. Its only network connection is a request to GitHub (`api.github.com`) about once a day to check whether a new version is available; GitHub receives only what any web request contains, such as your IP address. A new version is downloaded and installed only after you confirm it. The automatic check can be turned off: right-click the tray icon → «Перевіряти оновлення автоматично». The same is stated in the license agreement shown during installation.
+
+Програма не збирає і нікуди не надсилає відомості про ваш комп'ютер чи диски. Єдине мережеве з'єднання — запит до GitHub (`api.github.com`) приблизно раз на добу, щоб перевірити, чи вийшла нова версія; GitHub отримує лише те, що містить будь-який запит до сайту, наприклад IP-адресу. Нова версія завантажується і встановлюється тільки після вашого підтвердження. Автоматичну перевірку можна вимкнути: права кнопка миші на значку в треї → «Перевіряти оновлення автоматично». Те саме сказано в ліцензійній угоді, яку показує інсталятор.
+
+## Автор і ліцензія
 
 **Кирилюк Микола** — курсовий проєкт з дисципліни «Апаратні засоби» на тему «Розробка програмного застосунку для програмного моніторингу накопичувачів», 2026.
 
-© 2026 Кирилюк Микола. Усі права захищено.
+Вихідний код поширюється за ліцензією [MIT](LICENSE). © 2026 Кирилюк Микола.
