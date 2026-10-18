@@ -167,17 +167,6 @@ DiskMonitor/
 - **Температура чи SMART показують «—».** Запустіть програму з правами адміністратора. NVMe у режимі RAID (Intel RST) або в USB-кишені може не віддавати журнал стану. У USB-флешок даних про стан зазвичай немає взагалі.
 - **Порожня таблиця активності.** Лічильники продуктивності Windows вимкнені або пошкоджені. Відновити їх можна командою `lodctr /r` у командному рядку від імені адміністратора.
 
-## Code signing policy
-
-Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/).
-
-- Committers and reviewers: [Mykola Kyryliuk (s1xen7ag)](https://github.com/s1xen7ag)
-- Approvers: [Mykola Kyryliuk (s1xen7ag)](https://github.com/s1xen7ag)
-
-Release binaries are built from this repository by GitHub Actions ([build.yml](.github/workflows/build.yml)), and every release is approved manually before it is signed.
-
-Безкоштовний цифровий підпис надає SignPath.io, сертифікат — SignPath Foundation. Інсталятори збираються з цього репозиторію автоматично, а кожен випуск перед підписом підтверджує автор. *Статус: заявку на підпис подано; до її схвалення інсталятори не підписані.*
-
 ## Privacy policy
 
 This program does not collect or send any information about your computer or disks. Its only network connection is a request to GitHub (`api.github.com`) about once a day to check whether a new version is available; GitHub receives only what any web request contains, such as your IP address. A new version is downloaded and installed only after you confirm it. The automatic check can be turned off: right-click the tray icon → «Перевіряти оновлення автоматично». The same is stated in the license agreement shown during installation.
