@@ -84,8 +84,8 @@ enum {
     IDC_BTN_REFRESH = 101, IDC_BTN_DETAILS, IDC_BTN_REPORT, IDC_BTN_LOG, IDC_BTN_ADMIN, IDC_BTN_ABOUT,
     IDC_LIST_DISKS = 201, IDC_LIST_VOLS, IDC_LIST_LOAD, IDC_LIST_SMART, IDC_LIST_NVME,
     IDC_STATUS = 301,
-    ID_TRAY_OPEN = 401, ID_TRAY_REFRESH, ID_TRAY_EXIT, ID_TRAY_UPDATE_CHECK, ID_TRAY_UPDATE_AUTO,
-    IDB_UPDATE_NOW = 501, IDB_UPDATE_PAGE, IDB_ABOUT_UPDATE   // кнопки у вікнах TaskDialog
+    ID_TRAY_OPEN = 401, ID_TRAY_REFRESH, ID_TRAY_EXIT, ID_TRAY_UPDATE_CHECK, ID_TRAY_UPDATE_AUTO, ID_TRAY_UNINSTALL,
+    IDB_UPDATE_NOW = 501, IDB_UPDATE_PAGE, IDB_ABOUT_UPDATE, IDB_ABOUT_UNINSTALL   // кнопки у вікнах TaskDialog
 };
 
 // Номери колонок, які малюються особливо
@@ -126,6 +126,7 @@ struct AppState {
     bool updateBusy = false;         // зараз іде перевірка або завантаження
     bool updateWantManual = false;   // користувач попросив перевірку, поки йшла автоматична
     bool updateWantInstall = false;  // користувач натиснув «Оновити зараз», поки йшла перевірка
+    bool uninstalling = false;       // запущено видалення програми: під час закриття нічого не пишемо в журнал
     bool updateDialogOpen = false;
     bool balloonIsUpdate = false;    // останнє сповіщення в треї — про нову версію
     bool hasUpdate = false;          // знайдено новішу версію
@@ -1063,6 +1064,61 @@ static void OnUpdateFile(UpdateFileResult& r) {
     DestroyWindow(g.main);   // закриваємося, щоб інсталятор міг замінити файли програми
 }
 
+// ---------------------------------------------------------------------------
+// Видалення програми
+// ---------------------------------------------------------------------------
+
+// Деінсталятор Inno Setup лежить поруч із встановленою програмою; порожній рядок — програму
+// запущено не з установленої версії (наприклад, зібраний файл із папки bin)
+static std::wstring UninstallerPath() {
+    wchar_t exe[MAX_PATH] = L"";
+    GetModuleFileNameW(nullptr, exe, MAX_PATH);
+    std::wstring path = exe;
+    path.erase(path.find_last_of(L'\\') + 1);
+    path += L"unins000.exe";
+    return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES ? path : L"";
+}
+
+static void UninstallApp() {
+    std::wstring uninstaller = UninstallerPath();
+    if (uninstaller.empty()) {
+        wchar_t exe[MAX_PATH] = L"";
+        GetModuleFileNameW(nullptr, exe, MAX_PATH);
+        std::wstring text = L"Цю копію програми запущено не з установленої версії:\n" + std::wstring(exe) +
+                            L"\n\nДеінсталятор для неї не потрібен: достатньо закрити програму і видалити цей файл.";
+        MessageBoxW(DialogOwner(), text.c_str(), L"Видалення програми", MB_ICONINFORMATION | MB_SETFOREGROUND);
+        return;
+    }
+    if (MessageBoxW(DialogOwner(),
+            L"Видалити «Монітор стану дисків» з комп'ютера?\n\n"
+            L"Буде видалено програму, ярлики, автозапуск, налаштування і журнал подій. "
+            L"Програма закриється, після чого відкриється стандартний деінсталятор.",
+            L"Видалення програми", MB_ICONQUESTION | MB_YESNO | MB_DEFBUTTON2 | MB_SETFOREGROUND) != IDYES)
+        return;
+
+    // Деінсталятор не працює, поки запущена програма (перевіряє її mutex), тому звільняємо mutex заздалегідь
+    if (g.mutex) { CloseHandle(g.mutex); g.mutex = nullptr; }
+    SHELLEXECUTEINFOW sei{};
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOASYNC;
+    sei.hwnd = DialogOwner();
+    sei.lpVerb = L"open";
+    sei.lpFile = uninstaller.c_str();
+    sei.nShow = SW_SHOWNORMAL;
+    if (!ShellExecuteExW(&sei)) {
+        DWORD err = GetLastError();
+        g.mutex = CreateMutexW(nullptr, FALSE, kMutexName);   // програма працює далі
+        if (err != ERROR_CANCELLED)   // ERROR_CANCELLED — користувач відмовився у вікні UAC
+            MessageBoxW(DialogOwner(), (L"Не вдалося запустити деінсталятор (код помилки " + std::to_wstring(err) + L").").c_str(),
+                        L"Видалення програми", MB_ICONWARNING | MB_SETFOREGROUND);
+        return;
+    }
+    LogEvent(L"Запущено видалення програми");
+    g.uninstalling = true;
+    g.reallyExit = true;
+    DestroyWindow(g.main);
+}
+
 static void ShowAbout() {
     std::wstring instruction = std::wstring(APP_TITLE) + L", версія " + L"" APP_VERSION_STR;
     std::wstring content =
@@ -1074,7 +1130,10 @@ static void ShowAbout() {
         L"Щоб перевірити, чи вийшла нова версія, програма раз на добу звертається до GitHub. "
         L"Жодних даних про комп'ютер чи диски при цьому не надсилається.";
 
-    TASKDIALOG_BUTTON buttons[] = { { IDB_ABOUT_UPDATE, L"Перевірити оновлення" } };
+    TASKDIALOG_BUTTON buttons[] = {
+        { IDB_ABOUT_UPDATE, L"Перевірити оновлення" },
+        { IDB_ABOUT_UNINSTALL, L"Видалити програму…" },
+    };
     TASKDIALOGCONFIG tc{};
     tc.cbSize = sizeof(tc);
     tc.hwndParent = g.main;
@@ -1085,13 +1144,14 @@ static void ShowAbout() {
     tc.pszMainInstruction = instruction.c_str();
     tc.pszContent = content.c_str();
     tc.pButtons = buttons;
-    tc.cButtons = 1;
+    tc.cButtons = 2;
     tc.dwCommonButtons = TDCBF_OK_BUTTON;
     tc.nDefaultButton = IDOK;
 
     int pressed = IDOK;
-    if (SUCCEEDED(TaskDialogIndirect(&tc, &pressed, nullptr, nullptr)) && pressed == IDB_ABOUT_UPDATE)
-        StartUpdateCheck(true);
+    if (FAILED(TaskDialogIndirect(&tc, &pressed, nullptr, nullptr))) return;
+    if (pressed == IDB_ABOUT_UPDATE) StartUpdateCheck(true);
+    else if (pressed == IDB_ABOUT_UNINSTALL) UninstallApp();
 }
 
 // ---------------------------------------------------------------------------
@@ -1274,6 +1334,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             else KillTimer(hwnd, IDT_UPDATE);
             LogEvent(g.autoUpdate ? L"Автоматичну перевірку оновлень увімкнено" : L"Автоматичну перевірку оновлень вимкнено");
             break;
+        case ID_TRAY_UNINSTALL: UninstallApp(); break;
         case ID_TRAY_EXIT:
             g.reallyExit = true;
             DestroyWindow(hwnd);
@@ -1324,6 +1385,7 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             AppendMenuW(m, MF_STRING | (g.autoUpdate ? MF_CHECKED : 0), ID_TRAY_UPDATE_AUTO,
                         L"Перевіряти оновлення автоматично");
             AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(m, MF_STRING, ID_TRAY_UNINSTALL, L"Видалити програму…");
             AppendMenuW(m, MF_STRING, ID_TRAY_EXIT, L"Вихід");
             SetMenuDefaultItem(m, ID_TRAY_OPEN, FALSE);
             POINT pt;
@@ -1380,12 +1442,13 @@ static LRESULT CALLBACK MainProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         // інсталятору оновлення замінити свої файли.
         if (g_worker.joinable()) {
             if (WaitForSingleObject((HANDLE)g_worker.native_handle(), 10000) != WAIT_OBJECT_0) {
-                LogEvent(L"Програму закрито примусово: запит до диска не відповідав");
+                if (!g.uninstalling) LogEvent(L"Програму закрито примусово: запит до диска не відповідав");
                 TerminateProcess(GetCurrentProcess(), 0);
             }
             g_worker.join();
         }
-        LogEvent(L"Програму закрито");
+        // Під час видалення журнал не чіпаємо: деінсталятор видаляє його разом із програмою
+        if (!g.uninstalling) LogEvent(L"Програму закрито");
         PostQuitMessage(0);
         return 0;
     }

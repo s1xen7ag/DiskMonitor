@@ -6,7 +6,7 @@
 ; ============================================================================
 
 #define MyAppName      "Монітор стану дисків"
-#define MyAppVersion   "1.4"
+#define MyAppVersion   "1.5"
 #define MyAppPublisher "Кирилюк Микола"
 #define MyAppExe       "DiskMonitor.exe"
 ; Іменований mutex, який створює запущена програма (див. kMutexName у main.cpp)
@@ -50,7 +50,7 @@ WizardStyle=modern
 Compression=lzma2/max
 SolidCompression=yes
 
-VersionInfoVersion=1.4.0.0
+VersionInfoVersion=1.5.0.0
 VersionInfoDescription=Інсталятор програми «{#MyAppName}»
 VersionInfoProductName={#MyAppName}
 
@@ -73,6 +73,15 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExe}"; Tasks: deskto
 [Registry]
 ; Налаштування (перевірка оновлень) створює сама програма; тут лише видалення разом із програмою
 Root: HKCU; Subkey: "Software\DiskMonitorKursova"; Flags: uninsdeletekey dontcreatekey
+
+[UninstallDelete]
+; Журнал подій і завантажені під час оновлень інсталятори. Видаляються лише конкретні файли програми,
+; а не цілі папки: так деінсталятор з правами адміністратора не зачепить нічого зайвого, навіть якщо
+; на місці папки виявиться посилання на іншу папку
+Type: files; Name: "{localappdata}\DiskMonitor\events.log"
+Type: dirifempty; Name: "{localappdata}\DiskMonitor"
+Type: files; Name: "{%TEMP}\DiskMonitor_Update\DiskMonitor_Setup*.exe"
+Type: dirifempty; Name: "{%TEMP}\DiskMonitor_Update"
 
 [Run]
 ; Галочка на останній сторінці інсталятора
