@@ -18,6 +18,13 @@ struct SmartAttribute {
 
 enum class Health { Unknown, Good, Warning, Critical };
 
+// Ділянка диска для показу розмітки: розділ (зокрема службовий, без літери) або нерозподілене місце
+struct DiskArea {
+    std::wstring name;              // «C:», «службовий розділ EFI», «нерозподілено» …
+    uint64_t size = 0;
+    bool unallocated = false;
+};
+
 struct PhysicalDisk {
     int index = -1;                 // номер диска у Windows (PhysicalDrive0, 1, ...)
     std::wstring model;
@@ -29,6 +36,11 @@ struct PhysicalDisk {
     uint64_t size = 0;
     std::wstring letters;           // розділи на цьому диску, напр. "C: D:"
     bool isSsd = false;
+
+    // Розмітка диска: пояснює, чому обсяг диска більший за суму розділів, які видно в Провіднику
+    std::wstring partitionStyle;    // GPT / MBR
+    std::vector<DiskArea> layout;   // розділи і нерозподілене місце в порядку розташування на диску
+    uint64_t unallocated = 0;       // нерозподілене місце, байт
 
     // Що повідомляє сама Windows
     int winHealth = -1;             // 0 — справний, 1 — попередження, 2 — несправний
@@ -118,6 +130,7 @@ private:
     void ReadStorageInfo(Snapshot& s);
     void ReadSmart(Snapshot& s);
     void ReadVolumes(Snapshot& s);
+    void ReadLayout(Snapshot& s);
 
     IWbemServices* cimv2_ = nullptr;     // root\cimv2 — базова інформація
     IWbemServices* storage_ = nullptr;   // root\Microsoft\Windows\Storage — тип, стан, лічильники надійності

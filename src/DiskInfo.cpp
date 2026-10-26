@@ -4,7 +4,8 @@
 //   root\cimv2                        Win32_DiskDrive, Win32_LogicalDisk, Win32_LogicalDiskToPartition,
 //                                     Win32_PerfFormattedData_PerfDisk_PhysicalDisk (навантаження)
 //   root\Microsoft\Windows\Storage    MSFT_PhysicalDisk (тип HDD/SSD, стан),
-//                                     MSFT_StorageReliabilityCounter (температура, знос, години роботи)
+//                                     MSFT_StorageReliabilityCounter (температура, знос, години роботи),
+//                                     MSFT_Disk, MSFT_Partition (розмітка диска, нерозподілене місце)
 //   root\WMI                          MSStorageDriver_FailurePredictStatus / Data / Thresholds (SMART)
 //
 // Програма тільки ЧИТАЄ дані. Жодних операцій запису на диски не виконується.
@@ -433,6 +434,18 @@ std::wstring Pad(const std::wstring& label, size_t width = 28) {
     return s;
 }
 
+// Назва розділу без літери за його типом: GUID типу для дисків GPT або код типу для MBR
+std::wstring PartitionKind(std::wstring gptType, long long mbrType, bool isSystem) {
+    for (auto& c : gptType) c = (wchar_t)towlower(c);
+    if (gptType.find(L"c12a7328-f81f-11d2-ba4b-00a0c93ec93b") != std::wstring::npos) return L"службовий розділ EFI";
+    if (gptType.find(L"e3c9e316-0b5c-4db8-817d-f92df00215ae") != std::wstring::npos) return L"резерв Microsoft (MSR)";
+    if (gptType.find(L"de94bba4-06d1-4d40-a16a-bfd50179d6ac") != std::wstring::npos) return L"відновлення Windows";
+    if (mbrType == 0x27) return L"відновлення Windows";
+    if (mbrType == 0xEF) return L"службовий розділ EFI";
+    if (isSystem) return L"зарезервовано системою";
+    return L"розділ без літери";
+}
+
 } // namespace
 
 // ================= WmiReader =================
@@ -466,6 +479,7 @@ Snapshot WmiReader::ReadAll() {
     ReadStorageInfo(s);
     ReadSmart(s);
     ReadVolumes(s);
+    ReadLayout(s);
 
     for (auto& d : s.disks) {
         // Для NVMe таблиці SMART-атрибутів у WMI немає, тому читаємо журнал стану NVMe напряму
@@ -644,6 +658,61 @@ void WmiReader::ReadVolumes(Snapshot& s) {
             if (!d->letters.empty()) d->letters += L" ";
             d->letters += v.letter;
         }
+    }
+}
+
+// Розмітка диска: усі розділи, зокрема службові без літери (EFI, MSR, відновлення), і нерозподілене
+// місце між ними. Win32_LogicalDisk показує лише розділи з літерою, тому сума розділів у таблиці
+// менша за обсяг диска; ця функція пояснює, куди поділась різниця.
+void WmiReader::ReadLayout(Snapshot& s) {
+    if (!storage_) return;
+
+    std::map<int, uint64_t> diskSize;   // точний обсяг диска (Win32_DiskDrive.Size трохи менший)
+    Query(storage_, L"SELECT Number, Size, PartitionStyle FROM MSFT_Disk", [&](IWbemClassObject* o) {
+        PhysicalDisk* d = FindByIndex(s, (int)GetNum(o, L"Number"));
+        long long size = GetNum(o, L"Size", 0);
+        if (!d || size <= 0) return;
+        diskSize[d->index] = (uint64_t)size;
+        long long style = GetNum(o, L"PartitionStyle");
+        d->partitionStyle = style == 1 ? L"MBR" : style == 2 ? L"GPT" : L"";
+    });
+
+    struct Part { int disk; uint64_t offset, size; std::wstring name; };
+    std::vector<Part> parts;
+    Query(storage_, L"SELECT DiskNumber, DriveLetter, Offset, Size, GptType, MbrType, IsSystem "
+                    L"FROM MSFT_Partition", [&](IWbemClassObject* o) {
+        long long mbr = GetNum(o, L"MbrType", 0);
+        if (mbr == 0x05 || mbr == 0x0F) return;   // розширений розділ MBR лише містить інші розділи
+        long long off = GetNum(o, L"Offset"), size = GetNum(o, L"Size", 0);
+        if (off < 0 || size <= 0) return;
+        long long letter = GetNum(o, L"DriveLetter", 0);
+        std::wstring name = (letter >= L'A' && letter <= L'Z')
+            ? std::wstring(1, (wchar_t)letter) + L":"
+            : PartitionKind(GetStr(o, L"GptType"), mbr, GetNum(o, L"IsSystem", 0) == 1);
+        parts.push_back({ (int)GetNum(o, L"DiskNumber"), (uint64_t)off, (uint64_t)size, name });
+    });
+    std::sort(parts.begin(), parts.end(), [](const Part& a, const Part& b) {
+        return a.disk != b.disk ? a.disk < b.disk : a.offset < b.offset;
+    });
+
+    // Менші проміжки — це вирівнювання розділів і службові області GPT на початку та в кінці диска
+    const uint64_t minGap = 100ull << 20;
+    for (auto& [index, total] : diskSize) {
+        PhysicalDisk* d = FindByIndex(s, index);
+        uint64_t pos = 0;
+        auto addGap = [&](uint64_t end) {
+            if (end > pos && end - pos >= minGap) {
+                d->layout.push_back({ L"нерозподілено", end - pos, true });
+                d->unallocated += end - pos;
+            }
+        };
+        for (auto& p : parts) {
+            if (p.disk != index) continue;
+            addGap(p.offset);
+            d->layout.push_back({ p.name, p.size, false });
+            pos = std::max(pos, p.offset + p.size);
+        }
+        addGap(total);
     }
 }
 
@@ -956,6 +1025,20 @@ std::wstring DiskDescription(const PhysicalDisk& d) {
     t += Pad(L"Інтерфейс") + (d.bus.empty() ? na : d.bus) + nl;
     t += Pad(L"Обсяг") + FormatSize(d.size) + nl;
     t += Pad(L"Розділи") + (d.letters.empty() ? L"—" : d.letters) + nl;
+    if (!d.layout.empty()) {
+        t += L"Розмітка диска" + (d.partitionStyle.empty() ? L"" : L" (" + d.partitionStyle + L")") + L":" + nl;
+        for (auto& a : d.layout) {
+            std::wstring line = L"    " + a.name;
+            do line += L' '; while (line.size() < 28);
+            t += line + FormatSize(a.size) + nl;
+        }
+        // На SSD вільна від розділів ділянка контролеру лише на користь (додатковий резерв для
+        // вирівнювання зносу), тому пропонуємо її використати тільки для інших дисків
+        std::wstring hint = d.isSsd ? L" (на SSD це не шкодить і може трохи продовжити ресурс)"
+                                    : L" (можна використати в «Керуванні дисками» Windows)";
+        t += Pad(L"Нерозподілене місце") +
+             (d.unallocated ? FormatSize(d.unallocated) + hint : std::wstring(L"немає")) + nl;
+    }
     t += nl;
     t += Pad(L"Температура") + (d.temperature >= 0 ? std::to_wstring(d.temperature) + L" °C" : na) + nl;
     if (d.powerOnHours >= 0)

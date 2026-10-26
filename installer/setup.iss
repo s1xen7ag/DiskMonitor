@@ -6,7 +6,7 @@
 ; ============================================================================
 
 #define MyAppName      "Монітор стану дисків"
-#define MyAppVersion   "1.5"
+#define MyAppVersion   "1.6"
 #define MyAppPublisher "Кирилюк Микола"
 #define MyAppExe       "DiskMonitor.exe"
 ; Іменований mutex, який створює запущена програма (див. kMutexName у main.cpp)
@@ -50,7 +50,7 @@ WizardStyle=modern
 Compression=lzma2/max
 SolidCompression=yes
 
-VersionInfoVersion=1.5.0.0
+VersionInfoVersion=1.6.0.0
 VersionInfoDescription=Інсталятор програми «{#MyAppName}»
 VersionInfoProductName={#MyAppName}
 
